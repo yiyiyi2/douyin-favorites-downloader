@@ -612,6 +612,12 @@ class BrowserWatcher:
             if is_uncollect(url, body, req):
                 _u = collect_ids(req) or ids_from_url(url) or ["?"]
                 self.log(f"  · 取消收藏 {_u[0]} (不下载)")
+                # 用户点完马上取消的场景: 把还没开始抓的收藏撤掉, 免得下完才发现不要
+                try:
+                    with self._lock:
+                        self._pending_actions = [a for a in self._pending_actions if a != _u[0]]
+                except Exception:
+                    pass
                 return
             # 请求体里带的是「这一次操作的那个视频」, 最准确;
             # 响应体里常常带着整个收藏列表, 拿来当目标会误下, 只在前者为空时兜底。
@@ -673,6 +679,15 @@ class BrowserWatcher:
                         aw = self._hl_fetch(page, ctx, aid, cookies)
                     except Exception as e:
                         self.log(f"  ! 无头取详情失败 {aid}: {str(e)[:60]}")
+                        # 页面可能已被抖音跳转/崩溃弄死: 换个新的, 不然之后每次都失败
+                        try:
+                            if page.is_closed():
+                                page = ctx.new_page()
+                        except Exception:
+                            try:
+                                page = ctx.new_page()
+                            except Exception:
+                                break
                     self._hl_out.put((aid, aw))
                 try:
                     browser.close()

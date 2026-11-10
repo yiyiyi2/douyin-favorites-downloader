@@ -300,6 +300,7 @@ class EventBus:
             waiting = list(self.waiting)
             counters = dict(self.counters)
             status = dict(self.status)
+            failed = list(self.failed.values())
         recent = self._recent()
         today0 = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
         return {
@@ -309,7 +310,7 @@ class EventBus:
             "counters": counters,
             "active": active,
             "waiting": waiting,
-            "failed": list(self.failed.values()),
+            "failed": failed,
             "recent": recent[:300],
             "total": len(recent),
             "today": sum(1 for x in recent if (x.get("time") or 0) >= today0),
@@ -435,7 +436,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/log":
-            n = int((qs.get("lines") or ["120"])[0])
+            try:
+                n = int((qs.get("lines") or ["120"])[0])
+            except ValueError:
+                n = 120
+            n = max(1, min(n, 2000))
             try:
                 lines = self.bus.log_file.read_text(encoding="utf-8", errors="replace").splitlines()
             except Exception:
@@ -524,6 +529,11 @@ class _Handler(BaseHTTPRequestHandler):
                     t = self.bus.workspace / f
                     if t.is_file():
                         t.unlink(); removed = True
+                    elif t.is_dir():
+                        import shutil
+                        shutil.rmtree(t, ignore_errors=True)
+                        removed = True
+                    # _meta 跟文件放在一起(开了按作者分文件夹就是 downloads/作者/_meta/)
                     d = t.parent / "_meta" / f"{aid}.json"
                     if d.is_file():
                         d.unlink()

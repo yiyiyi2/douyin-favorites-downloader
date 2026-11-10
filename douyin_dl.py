@@ -117,7 +117,10 @@ def refetch_aweme(aid: str, session) -> dict | None:
 def log(msg: str = ""):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     with _log_lock:
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except Exception:
+            pass   # pythonw 下没有 stdout, print 会抛错; 守护模式全是 pythonw
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
@@ -414,8 +417,9 @@ def download_single(url: str, state: State) -> int:
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
+        err_lines = [x for x in (r.stderr or "").strip().splitlines() if x.strip()]
         log("  ! yt-dlp 解析失败:")
-        log("    " + (r.stderr or "").strip().splitlines()[-1] if r.stderr else "")
+        log("    " + (err_lines[-1] if err_lines else f"退出码 {r.returncode}, 无错误输出"))
         return 1
     for line in (r.stdout or "").splitlines():
         if line.strip():
@@ -473,6 +477,13 @@ def _acquire_instance_lock():
         fd = os.open(str(WORKSPACE / ".watcher.lock"), os.O_RDWR | os.O_CREAT)
     except OSError:
         return object()  # 拿不到锁文件也不该阻止正常使用
+
+    def _close(f):
+        try:
+            os.close(f)
+        except OSError:
+            pass
+
     try:
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
     except OSError:
@@ -480,27 +491,31 @@ def _acquire_instance_lock():
         # (文件锁理论上随进程消失, 但进程被强杀时偶尔会留下死锁文件)
         if not _has_live_watcher():
             try:
-                os.close(fd)
+                _close(fd)
                 os.remove(str(WORKSPACE / ".watcher.lock"))
                 fd = os.open(str(WORKSPACE / ".watcher.lock"), os.O_RDWR | os.O_CREAT)
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 return fd
             except OSError:
                 pass
-        os.close(fd)
+        _close(fd)
         return None
     return fd
 
 
 def _has_live_watcher() -> bool:
-    """有没有真的 douyin_dl.py 进程在跑(按命令行匹配, 不看锁文件)。"""
+    """有没有真的 douyin_dl.py 进程在跑(按命令行匹配, 不看锁文件)。
+
+    注意 daemon 守护模式下下载进程跑在 pythonw.exe 里, 只查 python.exe 会漏,
+    然后误判"没有活进程"把残留锁删掉, 造成两个守护各拉起一个监听互相抢。"""
     try:
         import subprocess
         out = subprocess.run(
-            ["wmic", "process", "where", "name='python.exe'", "get", "commandline"],
+            ["wmic", "process", "where",
+             "name='python.exe' or name='pythonw.exe'", "get", "commandline"],
             capture_output=True, text=True, timeout=10,
         ).stdout.lower()
-        return "douyin_dl.py" in out
+        return "douyin_dl.py" in out or "daemon.py" in out
     except Exception:
         return False  # 探测失败时保守认为没有, 允许覆盖残留锁
 
@@ -543,6 +558,23 @@ def main():
     log(f"  已记录: {len(state.done)} 个视频")
     log("")
 
+    if args.url:
+        return download_single(args.url, state)
+
+    # 延迟导入, 避免 --url 模式也要加载 playwright
+    from douyin_dl.watcher import BrowserWatcher
+
+    # 锁必须放在开面板/弹浏览器之前: 不然双击两次会把面板也起两份
+    # (旧顺序里第二次启动已经把面板/浏览器弹出来了才在这里退出)。
+    _LOCK = _acquire_instance_lock()
+    if _LOCK is None:
+        log("  ! 已经有一个下载进程在运行了, 这次不重复启动")
+        if _focus_existing_window():
+            log("    已经把抖音窗口切到前面了, 直接刷就行")
+        else:
+            log("    没找到正在运行的抖音窗口: 请把原来那个黑色窗口关掉, 再双击启动一次")
+        return 3
+
     bus = EventBus(WORKSPACE, OUT_DIR, STATE_FILE, LOG_FILE)
     ui_url = ""
     if not args.no_ui:
@@ -554,12 +586,6 @@ def main():
             bus.set_status(running=False, browser="", note="启动中")
             log(f"  面板: {ui_url}")
             log("")
-
-    if args.url:
-        return download_single(args.url, state)
-
-    # 延迟导入, 避免 --url 模式也要加载 playwright
-    from douyin_dl.watcher import BrowserWatcher
 
     dl = Downloader(state, session, bus=bus)
     dl.start()
@@ -594,15 +620,6 @@ def main():
         watcher.download_all_on_start = True
     else:
         watcher.download_all_on_start = False
-
-    _LOCK = _acquire_instance_lock()
-    if _LOCK is None:
-        log("  ! 已经有一个下载进程在运行了, 这次不重复启动")
-        if _focus_existing_window():
-            log("    已经把抖音窗口切到前面了, 直接刷就行")
-        else:
-            log("    没找到正在运行的抖音窗口: 请把原来那个黑色窗口关掉, 再双击启动一次")
-        return 3
 
     try:
         watcher.run()
