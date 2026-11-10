@@ -25,6 +25,8 @@ MAIN = WORKSPACE / "douyin_dl.py"
 RAPID_EXIT_SECS = 60
 MAX_RAPID = 5
 RESTART_DELAY = 5
+# 下载进程用这个退出码表示「用户主动关闭, 不要拉起」(如面板里关了自动重开、用户关掉全部抖音页)
+EXIT_INTENTIONAL = 7
 
 
 def _python_exe() -> str:
@@ -63,6 +65,11 @@ def guard():
 
         lived = time.time() - t0
         print(f"[daemon] 下载进程退出 (code={code}, 存活 {lived:.0f}s)", flush=True)
+
+        if code == EXIT_INTENTIONAL:
+            print("[daemon] 用户主动关闭(关掉了抖音且自动重开=关), 守护退出。"
+                  "下次双击 启动收藏下载.bat 再开始。", flush=True)
+            return
 
         if lived >= RAPID_EXIT_SECS:
             rapid = 0                      # 正常跑过一段时间的退出不算秒退
