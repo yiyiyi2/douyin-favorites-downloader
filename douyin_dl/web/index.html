@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>抖音收藏下载器</title>
+<style>
+  :root{
+    --bg:#0a0c10; --panel:#12161d; --panel-2:#171c25; --line:#232a36;
+    --txt:#e8ecf3; --muted:#8a94a6; --red:#fe2c55; --cyan:#25f4ee;
+    --ok:#33d17a; --warn:#f5a524; --err:#f04f5f;
+    --shadow:0 10px 30px rgba(0,0,0,.45);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:radial-gradient(1200px 600px at 15% -10%, #1a2030 0%, transparent 60%),
+               radial-gradient(900px 500px at 100% 0%, #1b1220 0%, transparent 55%), var(--bg);
+    color:var(--txt); font:14px/1.5 "Microsoft YaHei","Segoe UI",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit}
+  .wrap{max-width:1280px;margin:0 auto;padding:0 20px 60px}
+
+  /* ---------- 顶栏 ---------- */
+  header{
+    position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);
+    background:rgba(10,12,16,.72);border-bottom:1px solid var(--line);
+  }
+  .bar{max-width:1280px;margin:0 auto;padding:12px 20px;display:flex;align-items:center;gap:14px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:16px;letter-spacing:.3px}
+  .logo{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,var(--red),#ff6b81 45%,var(--cyan));
+        box-shadow:0 0 18px rgba(254,44,85,.45)}
+  .chips{display:flex;gap:8px;flex-wrap:wrap;margin-left:6px}
+  .chip{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;
+        background:var(--panel);border:1px solid var(--line);color:var(--muted);font-size:12px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--muted)}
+  .dot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+  .dot.off{background:var(--err)}
+  .grow{flex:1}
+  button{
+    font:inherit;color:var(--txt);background:var(--panel);border:1px solid var(--line);
+    padding:7px 13px;border-radius:10px;cursor:pointer;transition:.15s;white-space:nowrap
+  }
+  button:hover{background:var(--panel-2);border-color:#31394a}
+  button.primary{background:linear-gradient(135deg,var(--red),#ff5c76);border:none;color:#fff;font-weight:600}
+  button.primary:hover{filter:brightness(1.08)}
+  button.ghost{background:transparent}
+
+  /* ---------- 统计 ---------- */
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin:22px 0 8px}
+  .stat{background:linear-gradient(180deg,var(--panel),#0f131a);border:1px solid var(--line);
+        border-radius:14px;padding:14px 16px;position:relative;overflow:hidden}
+  .stat::after{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+        background:linear-gradient(90deg,var(--red),var(--cyan));opacity:.65}
+  .stat b{display:block;font-size:24px;font-weight:700;letter-spacing:.5px}
+  .stat span{color:var(--muted);font-size:12px}
+
+  /* ---------- 区块 ---------- */
+  h2{font-size:13px;color:var(--muted);font-weight:600;letter-spacing:1.2px;margin:26px 0 10px;
+     text-transform:uppercase;display:flex;align-items:center;gap:8px}
+  h2::after{content:"";flex:1;height:1px;background:var(--line)}
+
+  /* 正在下载 */
+  .active-list{display:flex;flex-direction:column;gap:10px}
+  .dl{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:12px 14px;
+      display:grid;grid-template-columns:56px 1fr auto;gap:12px;align-items:center}
+  .dl .cover{width:56px;height:56px;border-radius:10px;background:var(--panel-2);overflow:hidden;
+             display:flex;align-items:center;justify-content:center;color:#3a4356;font-size:18px}
+  .dl .cover{position:relative}
+  .dl .cover img{width:100%;height:100%;object-fit:cover;position:relative;z-index:1}
+  .dl .cover .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+  .dl .t{font-weight:600;margin-bottom:2px;display:flex;gap:8px;align-items:center}
+  .dl .t em{font-style:normal;font-size:11px;color:var(--muted);font-weight:400}
+  .dl .meta{color:var(--muted);font-size:12px}
+  .bar-bg{height:6px;border-radius:99px;background:#1d2432;margin-top:8px;overflow:hidden}
+  .bar-fg{height:100%;border-radius:99px;background:linear-gradient(90deg,var(--red),var(--cyan));
+          transition:width .35s ease}
+  .badge{font-size:11px;padding:2px 8px;border-radius:999px;background:#1b2230;color:var(--cyan);border:1px solid #24303f}
+
+  /* 队列 */
+  .queue{display:flex;flex-wrap:wrap;gap:8px}
+  .qitem{background:var(--panel);border:1px dashed #2b3444;border-radius:10px;padding:6px 10px;font-size:12px;
+         color:var(--muted);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  /* 工具栏 */
+  .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .search{flex:1;min-width:200px;position:relative}
+  .search input{
+    width:100%;padding:9px 12px 9px 34px;border-radius:10px;background:var(--panel);
+    border:1px solid var(--line);color:var(--txt);font:inherit;outline:none
+  }
+  .search input:focus{border-color:#38445a;box-shadow:0 0 0 3px rgba(37,244,238,.07)}
+  .search svg{position:absolute;left:11px;top:10px;opacity:.45}
+  .tabs{display:flex;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:3px}
+  .tabs button{border:none;background:transparent;padding:6px 12px;border-radius:8px;color:var(--muted);font-size:13px}
+  .tabs button.on{background:#222a38;color:var(--txt)}
+  select{background:var(--panel);border:1px solid var(--line);color:var(--txt);padding:9px 10px;border-radius:10px;font:inherit;outline:none}
+
+  /* 历史网格 */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;
+        transition:.18s;position:relative}
+  .card:hover{transform:translateY(-2px);border-color:#38445a;box-shadow:var(--shadow)}
+  .thumb{aspect-ratio:16/9;background:linear-gradient(135deg,#1b2231,#141a24);position:relative;
+         display:flex;align-items:center;justify-content:center;overflow:hidden}
+  .thumb img{width:100%;height:100%;object-fit:cover;display:block;position:relative;z-index:1}
+  .thumb .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+             font-size:26px;font-weight:700;color:#2f3a4d}
+  .thumb .tag{position:absolute;left:8px;top:8px;font-size:11px;padding:2px 7px;border-radius:6px;
+              background:rgba(0,0,0,.6);color:#dbe3f0;backdrop-filter:blur(4px)}
+  .thumb .dur{position:absolute;right:8px;bottom:8px;font-size:11px;padding:2px 6px;border-radius:6px;
+              background:rgba(0,0,0,.65);color:#dbe3f0}
+  .card .body{padding:10px 12px 12px}
+  .card .title{font-size:13px;font-weight:600;line-height:1.45;height:38px;overflow:hidden;
+               display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
+  .card .sub{display:flex;justify-content:space-between;gap:8px;color:var(--muted);font-size:11.5px;margin-top:6px}
+  .card .acts{display:flex;gap:6px;margin-top:10px;opacity:0;transition:.15s}
+  .card:hover .acts{opacity:1}
+  .card .acts button{flex:1;padding:5px 0;font-size:12px;border-radius:8px}
+
+  .empty{text-align:center;color:var(--muted);padding:60px 20px}
+  .empty b{display:block;color:var(--txt);font-size:15px;margin-bottom:6px}
+
+  /* 设置抽屉 */
+  .mask{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(3px);
+        display:none;z-index:40}
+  .mask.on{display:block}
+  .drawer{position:fixed;right:0;top:0;bottom:0;width:min(420px,92vw);background:#0f1319;
+          border-left:1px solid var(--line);transform:translateX(100%);transition:.25s;z-index:50;
+          padding:22px;overflow:auto}
+  .drawer.on{transform:none}
+  .drawer h3{margin:0 0 18px;font-size:16px}
+  .field{margin-bottom:18px}
+  .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px}
+  .field .val{font-size:13px;word-break:break-all}
+  .radios{display:grid;gap:8px}
+  .radio{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid var(--line);
+         border-radius:10px;cursor:pointer;background:var(--panel)}
+  .radio.on{border-color:var(--red);background:#1b1420}
+  .radio input{accent-color:var(--red)}
+
+  /* 日志 */
+  .logbox{background:#0b0f14;border:1px solid var(--line);border-radius:12px;padding:12px;
+          height:230px;overflow:auto;font:12px/1.6 Consolas,Menlo,monospace;color:#9fb0c6;white-space:pre-wrap}
+  .logbox::-webkit-scrollbar{width:8px}
+  .logbox::-webkit-scrollbar-thumb{background:#25303f;border-radius:8px}
+
+  /* toast */
+  .toasts{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:60}
+  .toast{background:#151b24;border:1px solid #2a3444;border-left:3px solid var(--ok);
+         border-radius:10px;padding:10px 14px;box-shadow:var(--shadow);min-width:220px;max-width:360px;
+         animation:in .25s ease}
+  @keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .toast .tt{font-weight:600;font-size:13px}
+  .toast .ts{color:var(--muted);font-size:12px;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .conn{position:fixed;left:50%;top:10px;transform:translateX(-50%);background:#3a1219;border:1px solid #6d2330;
+        color:#ffb3be;padding:6px 14px;border-radius:999px;font-size:12px;display:none;z-index:70}
+  .conn.on{display:block}
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <div class="brand"><span class="logo"></span> 抖音收藏下载器</div>
+    <div class="chips">
+      <span class="chip"><i class="dot" id="d-run"></i><span id="t-run">连接中…</span></span>
+      <span class="chip"><i class="dot" id="d-br"></i><span id="t-br">浏览器</span></span>
+      <span class="chip" id="t-up">—</span>
+      <span class="chip" id="t-q">画质: 最高</span>
+    </div>
+    <div class="grow"></div>
+    <button class="ghost" onclick="openWhat('log')">查看日志</button>
+    <button class="ghost" onclick="openWhat('douyin')">打开抖音</button>
+    <button class="primary" onclick="openWhat('folder')">下载文件夹</button>
+    <button onclick="toggleDrawer(true)">设置</button>
+  </div>
+</header>
+
+<div class="conn" id="conn">与后台断开，正在重连…</div>
+
+<div class="wrap">
+  <div class="stats">
+    <div class="stat"><b id="s-total">0</b><span>已下载视频</span></div>
+    <div class="stat"><b id="s-today">0</b><span>今天新增</span></div>
+    <div class="stat"><b id="s-size">0 MB</b><span>占用空间</span></div>
+    <div class="stat"><b id="s-ok">0</b><span>本次成功</span></div>
+    <div class="stat"><b id="s-skip">0</b><span>本次跳过</span></div>
+    <div class="stat"><b id="s-speed">0</b><span>峰值 MB/s</span></div>
+  </div>
+
+  <div id="activeWrap" style="display:none">
+    <h2>正在下载</h2>
+    <div class="active-list" id="active"></div>
+  </div>
+
+  <div id="queueWrap" style="display:none">
+    <h2>排队中</h2>
+    <div class="queue" id="queue"></div>
+  </div>
+
+  <h2>下载记录 <span id="cnt" style="color:#4a5568;font-size:12px"></span></h2>
+  <div class="toolbar">
+    <div class="search">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+      <input id="q" placeholder="搜索标题、作者或视频 ID…" oninput="render()">
+    </div>
+    <div class="tabs" id="tabs">
+      <button class="on" data-f="all" onclick="setFilter('all')">全部</button>
+      <button data-f="today" onclick="setFilter('today')">今天</button>
+      <button data-f="near" onclick="setFilter('near')">最近 20</button>
+      <button data-f="images" onclick="setFilter('images')">图文</button>
+    </div>
+    <select id="sort" onchange="render()">
+      <option value="time">按时间</option>
+      <option value="size">按大小</option>
+      <option value="quality">按画质</option>
+    </select>
+  </div>
+
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" style="display:none">
+    <b>还没有下载记录</b>去抖音点个『收藏』，这里就会实时出现
+  </div>
+
+  <h2>运行日志</h2>
+  <div class="logbox" id="logbox">加载中…</div>
+</div>
+
+<div class="mask" id="mask" onclick="toggleDrawer(false)"></div>
+<div class="drawer" id="drawer">
+  <h3>设置</h3>
+  <div class="field">
+    <label>下载画质</label>
+    <div class="radios" id="qualityRadios"></div>
+  </div>
+  <div class="field">
+    <label>下载目录</label>
+    <div class="val" id="outdir">—</div>
+  </div>
+  <div class="field">
+    <label>说明</label>
+    <div class="val" style="color:#8a94a6;font-size:12px;line-height:1.7">
+      点收藏后自动下载最高画质、无水印版本。<br>
+      画质设为 1080P/720P 可以省流量和磁盘。<br>
+      重复收藏同一个视频不会重复下载。
+    </div>
+  </div>
+  <button class="primary" style="width:100%" onclick="toggleDrawer(false)">完成</button>
+</div>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let STATE = null, FILTER = "all", lastIds = new Set(), firstLoad = true;
+
+function fmtSize(b){
+  if(!b) return "0 MB";
+  const mb = b/1048576;
+  if(mb >= 1024) return (mb/1024).toFixed(2)+" GB";
+  return mb.toFixed(mb<10?1:0)+" MB";
+}
+function fmtDur(ms){
+  if(!ms) return "";
+  const s = Math.round(ms/1000);
+  const m = Math.floor(s/60), r = s%60;
+  return m+":"+String(r).padStart(2,"0");
+}
+function fmtUp(sec){
+  if(sec<60) return sec+" 秒";
+  const m = Math.floor(sec/60), h = Math.floor(m/60);
+  if(h) return h+" 小时 "+(m%60)+" 分";
+  return m+" 分钟";
+}
+function ago(ts){
+  if(!ts) return "";
+  const d = Math.floor(Date.now()/1000 - ts);
+  if(d < 60) return "刚刚";
+  if(d < 3600) return Math.floor(d/60)+" 分钟前";
+  if(d < 86400) return Math.floor(d/3600)+" 小时前";
+  const dt = new Date(ts*1000);
+  return (dt.getMonth()+1)+"/"+dt.getDate();
+}
+function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function thumbHtml(item){
+  // 占位符永远铺在底层, 缩略图加载失败就把它自己藏起来 —— 不用往 HTML 属性里塞标签
+  const ch = esc((item.author || item.title || "?").slice(0, 1));
+  const ph = `<div class="ph">${ch}</div>`;
+  if(!item.id) return ph;
+  const src = "/api/thumb?id=" + encodeURIComponent(item.id);
+  return ph + `<img loading="lazy" src="${src}" onerror="this.style.display='none'">`;
+}
+
+// ---------- 渲染 ----------
+function render(){
+  if(!STATE) return;
+  const st = STATE.status || {};
+  $("d-run").className = "dot " + (st.running ? "on" : "off");
+  $("t-run").textContent = st.running ? "监听中" : "已停止";
+  const br = st.browser || "";
+  $("d-br").className = "dot " + (br ? "on" : "off");
+  $("t-br").textContent = br ? "浏览器已连接" : "浏览器未连接";
+  $("t-up").textContent = "已运行 " + fmtUp(STATE.uptime||0);
+  $("t-q").textContent = "画质: " + (STATE.quality_choices[STATE.quality] || STATE.quality);
+
+  $("s-total").textContent = STATE.total;
+  $("s-today").textContent = STATE.today;
+  $("s-size").textContent = fmtSize(STATE.bytes);
+  $("s-ok").textContent = STATE.counters.ok;
+  $("s-skip").textContent = STATE.counters.skip;
+  $("s-speed").textContent = (STATE.max_speed||0).toFixed(1);
+
+  // 正在下载
+  const act = STATE.active || [];
+  $("activeWrap").style.display = act.length ? "" : "none";
+  $("active").innerHTML = act.map(a=>{
+    const pct = a.pct || 0;
+    const sp = a.speed ? (a.speed/1048576).toFixed(1)+" MB/s" : "";
+    const left = a.total && a.speed ? Math.max(0, (a.total-a.done)/a.speed) : 0;
+    return `<div class="dl">
+      <div class="cover">${thumbHtml(a)}</div>
+      <div>
+        <div class="t">${esc(a.title||a.id)} ${a.quality?`<span class="badge">${esc(a.quality)}</span>`:""}</div>
+        <div class="meta">${esc(a.author||"")} · ${fmtSize(a.done)} / ${a.total?fmtSize(a.total):"?"}
+          ${sp?" · "+sp:""}${left?" · 剩余 "+Math.ceil(left)+"s":""}</div>
+        <div class="bar-bg"><div class="bar-fg" style="width:${pct}%"></div></div>
+      </div>
+      <div style="font-size:20px;font-weight:700;color:${pct>=100?"var(--ok)":"var(--cyan)"}">${pct.toFixed(0)}%</div>
+    </div>`;
+  }).join("");
+
+  // 队列
+  const wait = STATE.waiting || [];
+  $("queueWrap").style.display = wait.length ? "" : "none";
+  $("queue").innerHTML = wait.map(w=>
+    `<div class="qitem" title="${esc(w.title)}">⏳ ${esc(w.title||w.id)}</div>`).join("");
+
+  // 历史
+  let list = (STATE.recent||[]).slice();
+  const q = $("q").value.trim().toLowerCase();
+  if(q) list = list.filter(x => (x.title||"").toLowerCase().includes(q)
+                             || (x.author||"").toLowerCase().includes(q)
+                             || (x.id||"").includes(q));
+  if(FILTER==="today"){
+    const t0 = new Date(); t0.setHours(0,0,0,0);
+    list = list.filter(x => (x.time||0) >= t0.getTime()/1000);
+  } else if(FILTER==="near"){
+    list = list.slice(0,20);
+  } else if(FILTER==="images"){
+    list = list.filter(x => x.type==="images");
+  }
+  const sort = $("sort").value;
+  if(sort==="size") list.sort((a,b)=>(b.size||0)-(a.size||0));
+  if(sort==="quality") list.sort((a,b)=>String(b.quality).localeCompare(String(a.quality)));
+
+  $("cnt").textContent = list.length ? `(${list.length})` : "";
+  $("grid").innerHTML = list.map(x=>`
+    <div class="card" ondblclick="openWhat('file','${x.id}')">
+      <div class="thumb">
+        ${thumbHtml(x)}
+        ${x.type==="images"?`<span class="tag">图文</span>`:""}
+        ${x.quality && x.type!=="images"?`<span class="tag">${esc(x.quality)}</span>`:""}
+        ${x.duration?`<span class="dur">${fmtDur(x.duration)}</span>`:""}
+      </div>
+      <div class="body">
+        <div class="title">${esc(x.title || x.file || x.id)}</div>
+        <div class="sub"><span>${esc(x.author||"—")}</span><span>${ago(x.time)}</span></div>
+        <div class="sub"><span>${fmtSize(x.size)}</span><span>${esc((x.id||"").slice(-6))}</span></div>
+        <div class="acts">
+          <button onclick="openWhat('file','${x.id}')">打开</button>
+          <button onclick="openWhat('reveal','${x.id}')">定位</button>
+          <button onclick="copyLink('${x.id}')">链接</button>
+        </div>
+      </div>
+    </div>`).join("");
+  $("empty").style.display = list.length ? "none" : "";
+
+  // 新完成 -> 提示
+  const ids = new Set((STATE.recent||[]).map(x=>x.id));
+  if(!firstLoad){
+    (STATE.recent||[]).slice(0,5).forEach(x=>{
+      if(!lastIds.has(x.id)) toast(x.title||x.id, "下载完成 · " + fmtSize(x.size));
+    });
+  }
+  lastIds = ids; firstLoad = false;
+
+  // 设置里的画质单选项
+  if(!$("qualityRadios").dataset.ready){
+    $("qualityRadios").innerHTML = Object.entries(STATE.quality_choices).map(([k,v])=>
+      `<label class="radio ${k===STATE.quality?"on":""}" data-k="${k}">
+         <input type="radio" name="q" ${k===STATE.quality?"checked":""} onchange="setQuality('${k}')"> ${v}
+       </label>`).join("");
+    $("qualityRadios").dataset.ready = "1";
+  }
+  $("outdir").textContent = STATE.out_dir || "—";
+}
+
+function toast(title, sub){
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.innerHTML = `<div class="tt">${esc(title)}</div><div class="ts">${esc(sub)}</div>`;
+  $("toasts").appendChild(el);
+  setTimeout(()=>{ el.style.opacity=0; setTimeout(()=>el.remove(),300); }, 4200);
+}
+
+// ---------- 交互 ----------
+function setFilter(f){
+  FILTER = f;
+  [...$("tabs").children].forEach(b=>b.classList.toggle("on", b.dataset.f===f));
+  render();
+}
+function toggleDrawer(on){
+  $("drawer").classList.toggle("on", on);
+  $("mask").classList.toggle("on", on);
+}
+async function openWhat(what, id){
+  await fetch("/api/open", {method:"POST", headers:{"Content-Type":"application/json"},
+                            body: JSON.stringify({what, id})});
+}
+function copyLink(id){
+  const u = "https://www.douyin.com/video/" + id;
+  navigator.clipboard.writeText(u).then(()=>toast("已复制链接", u));
+}
+async function setQuality(k){
+  await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"},
+                                body: JSON.stringify({quality:k})});
+  [...$("qualityRadios").children].forEach(l=>l.classList.toggle("on", l.dataset.k===k));
+  toast("已切换画质", STATE.quality_choices[k]);
+}
+
+// ---------- 实时连接 ----------
+function connect(){
+  const es = new EventSource("/api/events");
+  es.onmessage = (e)=>{
+    $("conn").classList.remove("on");
+    try{ STATE = JSON.parse(e.data); render(); }catch(_){}
+  };
+  es.onerror = ()=>{
+    $("conn").classList.add("on");
+    es.close();
+    setTimeout(connect, 1500);
+  };
+}
+connect();
+
+// 日志
+async function pullLog(){
+  try{
+    const r = await fetch("/api/log?lines=200");
+    const d = await r.json();
+    const box = $("logbox");
+    const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
+    box.textContent = (d.lines || []).join("\n");
+    if(atBottom) box.scrollTop = box.scrollHeight;
+  }catch(_){}
+}
+pullLog();
+setInterval(pullLog, 3000);
+</script>
+</body>
+</html>

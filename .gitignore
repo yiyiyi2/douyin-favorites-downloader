@@ -1,0 +1,22 @@
+# 浏览器登录态 / 缓存（绝对不要提交, 里面是你的登录 Cookie）
+.chrome_profile/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# 下载产物与运行数据
+downloads/
+.thumbs/
+.state.json
+.settings.json
+.watcher.lock
+douyin_dl.log
+*.log
+
+# 临时文件
+*.part
+.tmp*
+_*.png
+_cookies.txt
+tmp_ytdlp*

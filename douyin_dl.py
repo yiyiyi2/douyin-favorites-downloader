@@ -1,0 +1,502 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+抖音收藏自动下载 —— 主程序
+
+用法:
+    python douyin_dl.py                 # 启动, 然后去抖音点收藏
+    python douyin_dl.py --download-all  # 启动时先把现有收藏补下回来
+    python douyin_dl.py --url <链接>     # 只下这一个视频, 不启动监听
+    python douyin_dl.py --check         # 检查浏览器登录状态
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import queue
+import sys
+import threading
+import time
+from pathlib import Path
+
+from douyin_dl.ui import (
+    EventBus,
+    filter_candidates,
+    load_settings,
+    save_settings,
+    start_ui,
+)
+
+from douyin_dl.core import (
+    build_filename,
+    build_session,
+    download,
+    parse_aweme,
+    probe_size,
+    safe_name,
+    verify_video,
+    VideoInfo,
+)
+
+WORKSPACE = Path(__file__).resolve().parent
+OUT_DIR = WORKSPACE / "downloads"
+STATE_FILE = WORKSPACE / ".state.json"
+PROFILE_DIR = WORKSPACE / ".chrome_profile"
+LOG_FILE = WORKSPACE / "douyin_dl.log"
+SETTINGS_FILE = WORKSPACE / ".settings.json"
+WEB_FILE = WORKSPACE / "douyin_dl" / "web" / "index.html"
+
+_log_lock = threading.Lock()
+
+
+def log(msg: str = ""):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    with _log_lock:
+        print(line, flush=True)
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 状态: 记录已下载的 aweme_id, 避免重复下载
+# ---------------------------------------------------------------------------
+
+class State:
+    def __init__(self, path: Path):
+        self.path = path
+        self.done: dict[str, dict] = {}
+        self.lock = threading.Lock()
+        self.load()
+
+    def load(self):
+        if self.path.exists():
+            try:
+                self.done = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                self.done = {}
+
+    def has(self, aweme_id: str) -> bool:
+        with self.lock:
+            return aweme_id in self.done
+
+    def mark(self, aweme_id: str, path: Path, quality: str):
+        with self.lock:
+            self.done[aweme_id] = {
+                "file": str(path.relative_to(WORKSPACE)) if path.is_relative_to(WORKSPACE) else str(path),
+                "quality": quality,
+                "time": int(time.time()),
+            }
+            try:
+                self.path.write_text(
+                    json.dumps(self.done, ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# 下载器线程
+# ---------------------------------------------------------------------------
+
+class Downloader(threading.Thread):
+    def __init__(self, state: State, session, log_fn=log, bus=None):
+        super().__init__(daemon=True)
+        self.q: queue.Queue[tuple[dict, str]] = queue.Queue()
+        self.state = state
+        self.session = session
+        self.log = log_fn
+        self.bus = bus
+        self.count_ok = 0
+        self.count_skip = 0
+        self.count_fail = 0
+
+    # -- 面板事件小工具 ------------------------------------------------
+    def _ev(self, name, *a):
+        if not self.bus:
+            return
+        try:
+            getattr(self.bus, name)(*a)
+        except Exception:
+            pass
+
+    def submit(self, aweme: dict, source: str):
+        self.q.put((aweme, source))
+        if self.bus:
+            aid = str(aweme.get("aweme_id") or "")
+            if aid:
+                try:
+                    _i = parse_aweme(aweme)
+                    self._ev("add_waiting", aid, _i.desc[:60], _i.author, source)
+                except Exception:
+                    self._ev("add_waiting", aid, "", "", source)
+
+    def run(self):
+        while True:
+            aweme, source = self.q.get()
+            try:
+                self.process(aweme, source)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"  ! 处理出错: {e}")
+                self.count_fail += 1
+            finally:
+                self.q.task_done()
+
+    def process(self, aweme: dict, source: str):
+        info = parse_aweme(aweme)
+        if not info.aweme_id:
+            return
+
+        if self.state.has(info.aweme_id):
+            self.count_skip += 1
+            self._ev("pop_waiting", info.aweme_id)
+            self._ev("skip")
+            return
+
+        label = f"{info.author} - {info.desc[:40]}" if info.author else info.desc[:50]
+        self.log("")
+        self.log(f"▼ [{source}] {label or info.aweme_id}")
+
+        if info.is_image_post and not info.candidates:
+            self._save_images(info)
+            return
+
+        # 界面里可以限制最高画质(省流量); 没设就是最高画质
+        pref = load_settings(SETTINGS_FILE).get("quality", "max")
+        cands = filter_candidates(info.candidates, pref)
+
+        # 按画质从高到低排序。首选失败(常见的 403: 有的地址带 tk=webid,
+        # 需要播放器内部令牌, 直接下载会被拒)就依次退到下一个候选。
+        order = sorted(cands, key=lambda c: c.score(), reverse=True)
+        best = order[0] if order else None
+        if not best:
+            self.log("  ! 没有可用的视频地址, 跳过")
+            self.count_fail += 1
+            self._ev("pop_waiting", info.aweme_id)
+            self._ev("finish", info.aweme_id, False)
+            return
+
+        # 探一下体积, 顺便验证地址可用
+        size = probe_size(self.session, best.url)
+        res = f"{best.width}x{best.height}" if best.width else "?"
+        cands = len(info.candidates)
+        self.log(
+            f"  画质: {res}  码率={best.bitrate or '?'}  "
+            f"候选={cands} 个  {size / 1048576:.1f} MB" if size else
+            f"  画质: {res}  候选={cands} 个  大小未知"
+        )
+
+        stem = build_filename(info)
+        dest = OUT_DIR / f"{stem}.mp4"
+
+        # 已经有同名文件(可能是上次没记进 state)就直接登记
+        if dest.exists() and dest.stat().st_size > 0:
+            self.log(f"  已存在, 跳过: {dest.name}")
+            self.state.mark(info.aweme_id, dest, f"{res}")
+            self.count_skip += 1
+            self._ev("pop_waiting", info.aweme_id)
+            self._ev("skip")
+            return
+
+        self.log(f"  下载中 -> downloads/{dest.name}")
+        self._ev("begin", info.aweme_id, {
+            "title": info.desc[:70] or info.aweme_id,
+            "author": info.author,
+            "cover": (info.cover_urls[0] if info.cover_urls else ""),
+            "quality": res,
+            "size": size,
+        })
+        t0 = time.time()
+        ok = False
+        aid = info.aweme_id
+        for i, cand in enumerate(order[:5]):
+            if i:
+                self.log(f"  换候选 {i + 1}/{min(len(order), 5)}: "
+                         f"{cand.width}x{cand.height} 码率={cand.bitrate or '?'}")
+            if download(self.session, cand.url, dest, log=self.log,
+                        on_progress=lambda d, t: self._ev("progress", aid, d, t)):
+                ok = True
+                best = cand
+                break
+        if not ok:
+            self.log("  × 所有候选地址都下载失败")
+            self.count_fail += 1
+            self._ev("finish", info.aweme_id, False)
+            return
+
+        if not verify_video(dest):
+            self.log("  × 文件校验失败(可能不是有效视频), 已保留待查")
+            self.count_fail += 1
+            self._ev("finish", info.aweme_id, False)
+            return
+
+        dt = time.time() - t0
+        mb = dest.stat().st_size / 1048576
+        speed = mb / dt if dt > 0 else 0
+        self.log(f"  ✔ 完成  {mb:.1f} MB  {dt:.1f}s  ({speed:.1f} MB/s)")
+
+        # 顺手存一份元数据, 方便以后查
+        self._save_meta(info, dest, res)
+        self.state.mark(info.aweme_id, dest, res)
+        self.count_ok += 1
+        self._ev("set_speed", speed)
+        self._ev("finish", info.aweme_id, True, {"size": dest.stat().st_size})
+
+    def _save_meta(self, info: VideoInfo, dest: Path, quality: str):
+        meta = {
+            "aweme_id": info.aweme_id,
+            "desc": info.desc,
+            "author": info.author,
+            "author_id": info.author_id,
+            "create_time": info.create_time,
+            "duration_ms": info.duration,
+            "music": f"{info.music_title} - {info.music_author}".strip(" -"),
+            "file": dest.name,
+            "quality": quality,
+            "cover": (info.cover_urls[0] if info.cover_urls else ""),
+            "all_candidates": [
+                {"w": c.width, "h": c.height, "bitrate": c.bitrate, "gear": c.gear_name}
+                for c in info.candidates
+            ],
+            "downloaded_at": int(time.time()),
+        }
+        meta_dir = OUT_DIR / "_meta"
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            (meta_dir / f"{info.aweme_id}.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            pass
+
+    def _save_images(self, info: VideoInfo):
+        """图文作品: 逐张下原图。"""
+        folder = OUT_DIR / build_filename(info)
+        folder.mkdir(parents=True, exist_ok=True)
+        ok = 0
+        for i, u in enumerate(info.image_urls, 1):
+            ext = ".jpg"
+            if ".png" in u.lower():
+                ext = ".png"
+            elif ".webp" in u.lower():
+                ext = ".webp"
+            p = folder / f"{i:02d}{ext}"
+            if download(self.session, u, p, log=self.log):
+                ok += 1
+        self.log(f"  ✔ 图文作品: 已保存 {ok}/{len(info.image_urls)} 张 -> {folder.name}/")
+        if ok:
+            self.state.mark(info.aweme_id, folder, "images")
+            self.count_ok += 1
+            self._ev("finish", info.aweme_id, True)
+        else:
+            self.count_fail += 1
+            self._ev("finish", info.aweme_id, False)
+
+
+# ---------------------------------------------------------------------------
+# 单链接下载(不依赖浏览器)
+# ---------------------------------------------------------------------------
+
+def download_single(url: str, state: State) -> int:
+    """
+    直接下载一个链接。
+    先用 yt-dlp 抓详情(它内置了抖音解析), 失败再提示需要用 --watch 模式。
+    """
+    import subprocess
+
+    log(f"解析链接: {url}")
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--no-playlist",
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", str(OUT_DIR / "%(uploader)s_%(title).70B_%(id)s.%(ext)s"),
+        "--print", "after_move:filepath",
+        "--no-warnings",
+        url,
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if r.returncode != 0:
+        log("  ! yt-dlp 解析失败:")
+        log("    " + (r.stderr or "").strip().splitlines()[-1] if r.stderr else "")
+        return 1
+    for line in (r.stdout or "").splitlines():
+        if line.strip():
+            log(f"  ✔ 已保存: {line.strip()}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
+def _focus_existing_window(port: int = 9222) -> bool:
+    """
+    第二次双击启动时, 把已经在跑的那个抖音窗口提到最前面。
+
+    不然用户只会看到"已经在运行了"然后什么都没有, 很像程序坏了。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=5000)
+            pages = [pg for ctx in browser.contexts for pg in ctx.pages
+                     if not pg.is_closed()]
+            pages.sort(key=lambda pg: 0 if "douyin.com" in (pg.url or "") else 1)
+            for pg in pages:
+                try:
+                    pg.bring_to_front()
+                    return True
+                except Exception:
+                    continue
+    except Exception:
+        return False
+    return False
+
+
+def _acquire_instance_lock():
+    """
+    保证同一时间只有一个监听进程。
+
+    踩过的坑: 重复启动会起来两个进程, 都挂在同一个浏览器上, 互相抢页面、
+    同一条收藏被下载两遍, 而且关掉其中一个浏览器就整个不能用了。
+    用 Windows 文件锁实现, 进程被强杀时锁也会自动释放。
+    """
+    import os
+
+    try:
+        import msvcrt
+    except ImportError:
+        return object()  # 非 Windows 直接放行
+
+    try:
+        fd = os.open(str(WORKSPACE / ".watcher.lock"), os.O_RDWR | os.O_CREAT)
+    except OSError:
+        return object()  # 拿不到锁文件也不该阻止正常使用
+    try:
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+_LOCK = None
+
+
+def main():
+    global _LOCK
+
+    ap = argparse.ArgumentParser(
+        description="抖音收藏自动下载(最高画质 / 无水印)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--url", help="只下载指定链接, 不启动监听")
+    ap.add_argument("--download-all", action="store_true",
+                    help="启动时先把当前收藏里的所有视频补下回来")
+    ap.add_argument("--check", action="store_true", help="只检查登录状态")
+    ap.add_argument("--port", type=int, default=9222, help="Chrome 调试端口")
+    ap.add_argument("--headless", action="store_true", help="无头模式(需要已登录过)")
+    ap.add_argument("--output", help="输出目录 (默认 ./downloads)")
+    ap.add_argument("--ui-port", type=int, default=8899, help="本地面板端口 (默认 8899)")
+    ap.add_argument("--no-ui", action="store_true", help="不启动本地面板, 也不打开浏览器")
+    ap.add_argument("--no-open", action="store_true", help="启动面板但不要自动打开浏览器")
+    args = ap.parse_args()
+
+    global OUT_DIR
+    if args.output:
+        OUT_DIR = Path(args.output).resolve()
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    state = State(STATE_FILE)
+    session = build_session()
+
+    log("=" * 62)
+    log("  抖音收藏自动下载  |  最高画质 · 无水印")
+    log("=" * 62)
+    log(f"  工作区: {WORKSPACE}")
+    log(f"  输出到: {OUT_DIR}")
+    log(f"  已记录: {len(state.done)} 个视频")
+    log("")
+
+    bus = EventBus(WORKSPACE, OUT_DIR, STATE_FILE, LOG_FILE)
+    ui_url = ""
+    if not args.no_ui:
+        settings = load_settings(SETTINGS_FILE)
+        want_open = bool(settings.get("open_browser", True)) and not args.no_open
+        ui_url = start_ui(bus, WEB_FILE, port=args.ui_port,
+                          open_browser=want_open, log=log)
+        if ui_url:
+            bus.set_status(running=False, browser="", note="启动中")
+            log(f"  面板: {ui_url}")
+            log("")
+
+    if args.url:
+        return download_single(args.url, state)
+
+    # 延迟导入, 避免 --url 模式也要加载 playwright
+    from douyin_dl.watcher import BrowserWatcher
+
+    dl = Downloader(state, session, bus=bus)
+    dl.start()
+
+    watcher = BrowserWatcher(
+        profile_dir=PROFILE_DIR,
+        port=args.port,
+        on_aweme=lambda aw, src: dl.submit(aw, src),
+        # 抖音视频地址带 tk=webid, 绑定登录态, 下载必须带同一套 Cookie, 否则 403
+        on_cookie=lambda c: session.headers.update({"Cookie": c}),
+        log=log,
+        headless=args.headless,
+        on_status=lambda kw: bus.set_status(**kw),
+    )
+
+    if args.check:
+        # 只检查登录: 起浏览器 -> 查 cookie -> 退出
+        if not watcher.start_chrome():
+            return 2
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as p:
+            b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
+            ctx = b.contexts[0] if b.contexts else b.new_context()
+            ok = BrowserWatcher.check_login(ctx)
+        log(f"  登录状态: {'✔ 已登录' if ok else '✘ 未登录'}")
+        return 0 if ok else 1
+
+    if args.download_all:
+        log("  模式: 先补下现有收藏, 再进入监听")
+        watcher.download_all_on_start = True
+    else:
+        watcher.download_all_on_start = False
+
+    _LOCK = _acquire_instance_lock()
+    if _LOCK is None:
+        log("  ! 已经有一个下载进程在运行了, 这次不重复启动")
+        if _focus_existing_window():
+            log("    已经把抖音窗口切到前面了, 直接刷就行")
+        else:
+            log("    没找到正在运行的抖音窗口: 请把原来那个黑色窗口关掉, 再双击启动一次")
+        return 3
+
+    try:
+        watcher.run()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        log("")
+        log(f"  本次统计: 成功 {dl.count_ok} · 跳过 {dl.count_skip} · 失败 {dl.count_fail}")
+        log(f"  文件在: {OUT_DIR}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
