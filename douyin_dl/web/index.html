@@ -280,6 +280,13 @@
     </div>
   </div>
   <div class="field">
+    <label>退出抖音后自动重新打开</label>
+    <div class="radios" id="autoReopenRadios">
+      <label class="radio" data-k="0"><input type="radio" name="ar" onchange="setAutoReopen(0)"> 关（关掉抖音监听自动结束）</label>
+      <label class="radio" data-k="1"><input type="radio" name="ar" onchange="setAutoReopen(1)"> 开（关掉约 1 分钟后自动重新打开）</label>
+    </div>
+  </div>
+  <div class="field">
     <label>下载目录</label>
     <div class="val" id="outdir">—</div>
   </div>
@@ -341,13 +348,13 @@ function thumbHtml(item){
 
 function thumbRetry(img){
   const n = (parseInt(img.dataset.rv || "0", 10)) + 1;
-  if(n > 5){ img.style.display = "none"; return; }
+  if(n > 15){ img.style.display = "none"; return; }   // 约 2.5 分钟内持续重试, 服务端现场拉封面可能要十几秒
   img.dataset.rv = String(n);
   setTimeout(() => {
     if(!img.isConnected) return;
     img.style.display = "";
     img.src = img.src.split("&rv=")[0] + "&rv=" + n;
-  }, 1200 * n);
+  }, Math.min(1200 * n, 8000));
 }
 
 // ---------- 渲染 ----------
@@ -488,6 +495,18 @@ function render(){
     const on = STATE.by_author ? 1 : 0;
     [...$("byAuthorRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === on));
   }
+  // 「退出抖音后自动重新打开」单选状态
+  if(!$("autoReopenRadios").dataset.ready){
+    const on = (STATE.auto_reopen !== false) ? 1 : 0;
+    [...$("autoReopenRadios").children].forEach(l=>{
+      l.classList.toggle("on", +l.dataset.k === on);
+      l.querySelector("input").checked = (+l.dataset.k === on);
+    });
+    $("autoReopenRadios").dataset.ready = "1";
+  } else {
+    const on = (STATE.auto_reopen !== false) ? 1 : 0;
+    [...$("autoReopenRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === on));
+  }
 }
 
 // 近 14 天下载量柱状图(纯 CSS)
@@ -537,6 +556,15 @@ async function setByAuthor(v){
   [...$("byAuthorRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
   toast(v ? "已开启按作者分文件夹" : "已关闭按作者分文件夹",
         v ? "新下载会存到 downloads/作者名/" : "新下载全部放 downloads/");
+}
+
+// 设置: 退出抖音后是否自动重新打开
+async function setAutoReopen(v){
+  await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"},
+                                body: JSON.stringify({auto_reopen: !!v})});
+  [...$("autoReopenRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
+  toast(v ? "已开启自动重开" : "已关闭自动重开",
+        v ? "关掉抖音约 1 分钟后会自动重新打开" : "你关掉抖音后监听会自动结束, 下载也停了");
 }
 
 // 右键菜单

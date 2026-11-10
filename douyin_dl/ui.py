@@ -55,7 +55,7 @@ QUALITY_CHOICES = {
 # ---------------------------------------------------------------------------
 
 def load_settings(path: Path) -> dict:
-    data = {"quality": "max", "open_browser": True}
+    data = {"quality": "max", "open_browser": True, "auto_reopen": True, "by_author": False}
     try:
         if path.exists():
             data.update(json.loads(path.read_text(encoding="utf-8")))
@@ -320,6 +320,7 @@ class EventBus:
             "quality_choices": QUALITY_CHOICES,
             "out_dir": str(self.out_dir),
             "by_author": bool(load_settings(self.workspace / ".settings.json").get("by_author")),
+            "auto_reopen": bool(load_settings(self.workspace / ".settings.json").get("auto_reopen", True)),
         }
 
     @property
@@ -419,10 +420,16 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/thumb":
             aid = (qs.get("id") or [""])[0]
             data = self.bus.thumb(aid) if aid else None
-            # 没有封面时回一张 1x1 灰色图, 免得浏览器控制台刷一堆 404
+            # 没封面时回 404(带 no-store), 让前端 thumbRetry 走 onerror 自动重试;
+            # 之前回 200 的 1x1 占位图, 浏览器当成加载成功, 就永远不重试了 -> 新下载的没预览图
             if not data:
-                data, ctype = _BLANK_IMG, "image/png"
-            elif data[:3] == b"\xff\xd8\xff":       # JPEG 魔数
+                self.send_response(404)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Cache-Control", "no-store, max-age=0")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if data[:3] == b"\xff\xd8\xff":       # JPEG 魔数
                 ctype = "image/jpeg"
             elif data[:4] == b"\x89PNG":
                 ctype = "image/png"
@@ -432,7 +439,7 @@ class _Handler(BaseHTTPRequestHandler):
                 ctype = "image/webp"
             else:
                 ctype = "application/octet-stream"
-            self._bytes(data, ctype, cache=bool(data and data is not _BLANK_IMG))
+            self._bytes(data, ctype, cache=True)
             return
 
         if path == "/api/log":
@@ -498,6 +505,8 @@ class _Handler(BaseHTTPRequestHandler):
                 cur["quality"] = body["quality"]
             if isinstance(body.get("by_author"), bool):
                 cur["by_author"] = body["by_author"]
+            if isinstance(body.get("auto_reopen"), bool):
+                cur["auto_reopen"] = body["auto_reopen"]
             save_settings(path, cur)
             self.bus.publish()
             self._json({"ok": True, "settings": cur})
@@ -592,21 +601,27 @@ class _Handler(BaseHTTPRequestHandler):
 
 def start_ui(bus: EventBus, web_file: Path, port: int = 8899,
              open_browser: bool = True, log=print) -> str:
-    """起面板服务, 返回访问地址。端口被占就往后找几个。"""
+    """起面板服务, 返回访问地址。
+
+    严格单实例: 8899 已被占用说明面板已经在跑(守护重启/双击 bat 都会遇到),
+    这时不再起新面板也不弹浏览器, 直接返回空 —— 用户浏览器里那个标签页还活着,
+    SSE 会自动重连到新进程。"""
     _Handler.bus = bus
     _Handler.web_file = web_file
-    server = None
-    last_err = None
-    for p in range(port, port + 20):
-        try:
-            server = ThreadingHTTPServer(("127.0.0.1", p), _Handler)
-            port = p
-            break
-        except OSError as e:
-            last_err = e
-            continue
-    if server is None:
-        log(f"  ! 面板端口被占用, 起不来: {last_err}")
+    # 先探测是不是已有面板在跑
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=2) as r:
+            if r.status == 200:
+                log(f"  面板已在运行: http://127.0.0.1:{port}/ (不重复打开)")
+                return ""
+    except Exception:
+        pass
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    except OSError as e:
+        # 8899 被别的程序占了(不是我们的面板): 不顺延端口, 避免开出多个面板
+        log(f"  ! 面板端口 {port} 被其他程序占用, 本次不启动面板: {e}")
         return ""
 
     threading.Thread(target=server.serve_forever, daemon=True, name="dy-ui").start()
