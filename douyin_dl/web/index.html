@@ -312,6 +312,7 @@ function fmtDur(ms){
   const m = Math.floor(s/60), r = s%60;
   return m+":"+String(r).padStart(2,"0");
 }
+function fmtTime(ts){ if(!ts) return ""; const d=new Date(ts*1000); const p=(n)=>String(n).padStart(2,"0"); return (d.getMonth()+1)+"/"+d.getDate()+" "+p(d.getHours())+":"+p(d.getMinutes()); }
 function fmtUp(sec){
   if(sec<60) return sec+" 秒";
   const m = Math.floor(sec/60), h = Math.floor(m/60);
@@ -352,6 +353,13 @@ function thumbRetry(img){
 // ---------- 渲染 ----------
 function render(){
   if(!STATE) return;
+  // 服务端字段缺失时兜底, 防止一条异常 SSE 把整个 render 打断
+  STATE.status = STATE.status || {};
+  STATE.counters = STATE.counters || {ok:0,skip:0,fail:0};
+  STATE.failed = STATE.failed || [];
+  STATE.recent = STATE.recent || [];
+  STATE.waiting = STATE.waiting || [];
+  STATE.active = STATE.active || [];
   const st = STATE.status || {};
   $("d-run").className = "dot " + (st.running ? "on" : "off");
   $("t-run").textContent = st.running ? "监听中" : "已停止";
@@ -519,7 +527,7 @@ async function delRec(aid){
   const r = await fetch("/api/delete", {method:"POST", headers:{"Content-Type":"application/json"},
                                        body: JSON.stringify({id: aid})});
   const j = await r.json();
-  toast(j.removed ? "已删除" : "删除失败", j.removed ? "文件和记录都清掉了" : "文件可能已经不在了");
+  toast(j.ok ? "已删除" : "删除失败", j.ok ? "文件和记录都清掉了" : "文件可能已经不在了");
 }
 
 // 设置: 按作者分文件夹

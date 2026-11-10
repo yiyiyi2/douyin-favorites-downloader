@@ -988,10 +988,8 @@ class BrowserWatcher:
 
     # -- 主循环 ------------------------------------------------------------
     def run(self):
-        """跑监听主循环。返回 0 正常结束; 7 = 用户主动关闭(守护看到 7 不再拉起)。"""
         if not self.start_chrome():
             return
-        self._intentional_exit = False
 
         try:
             with sync_playwright() as p:
@@ -1032,10 +1030,6 @@ class BrowserWatcher:
                     deadline = time.time() + 600
                     while time.time() < deadline:
                         time.sleep(2)
-                        # Chrome 起来又死了就别干等 10 分钟: 退出让守护重新走一遍流程
-                        if getattr(self, "_browser", None) is not None                                 and not self._browser.is_connected():
-                            self.log("! 浏览器在登录等待时关闭了, 监听结束")
-                            return
                         self.pump(ctx)
                         if self.check_login(ctx):
                             break
@@ -1077,19 +1071,7 @@ class BrowserWatcher:
                     try:
                         # 用户关掉浏览器后, ctx 可能仍然"看着正常", 只有这个能可靠判断
                         if getattr(self, "_browser", None) is not None                                 and not self._browser.is_connected():
-                            # 关掉最后一个抖音 tab 后 Chrome 窗口会消失, is_connected 随之变 False
-                            # —— 这才是用户"关掉抖音"的真实路径(而不是下面的 tick%150 分支)。
-                            # auto_reopen=关: 视为用户主动关闭, 用退出码 7 告诉守护别再拉起。
-                            try:
-                                from douyin_dl.ui import load_settings
-                                _sr = load_settings(Path(__file__).resolve().parent.parent / ".settings.json").get("auto_reopen", True)
-                            except Exception:
-                                _sr = True
-                            if not _sr:
-                                self.log("  自动重开已关闭, 抖音已关闭, 监听结束")
-                                self._intentional_exit = True
-                            else:
-                                self.log("  ! 浏览器已经关掉了, 监听结束")
+                            self.log("  ! 浏览器已经关掉了, 监听结束")
                             break
                         self.pump(ctx)             # 让 Playwright 收包(同时处理 binding 回调)
                         err = 0
@@ -1113,29 +1095,9 @@ class BrowserWatcher:
                             except Exception:
                                 pass
                         self._sync_cookies(ctx)
-                    if tick % 150 == 0:            # 每 ~60 秒: 窗口被关空了看情况补一个
+                    if tick % 150 == 0:            # 每 ~60 秒: 窗口被关空了就补一个
                         try:
-                            # 不用 ctx.pages —— 页面全关后 pump 不再通信, 销毁事件永远收不到,
-                            # pages 列表就是死的。直接问 CDP 要真实 target 列表(HTTP 一次往返)。
-                            import urllib.request as _ur, json as _json
-                            try:
-                                _tabs = _json.loads(_ur.urlopen(
-                                    f"http://127.0.0.1:{self.port}/json/list", timeout=5).read())
-                                _has_dy = any("douyin.com" in t.get("url", "")
-                                              for t in _tabs if t.get("type") == "page")
-                            except Exception:
-                                _has_dy = bool([x for x in ctx.pages if not x.is_closed()])
-                            if not _has_dy:
-                                # 用户可关掉自动重开: 面板设置里"退出抖音后不再自动打开"
-                                try:
-                                    from douyin_dl.ui import load_settings
-                                    _sr = load_settings(Path(__file__).resolve().parent.parent / ".settings.json").get("auto_reopen", True)
-                                except Exception:
-                                    _sr = True
-                                if not _sr:
-                                    self.log("  自动重开已关闭, 抖音已全部关闭, 监听结束")
-                                    self._intentional_exit = True
-                                    break
+                            if not [x for x in ctx.pages if not x.is_closed()]:
                                 self.log("  浏览器里没有页面了, 重新打开抖音…")
                                 if self._ensure_douyin_tab(ctx) is not None:
                                     reopen_fail = 0
@@ -1161,7 +1123,6 @@ class BrowserWatcher:
             except Exception:
                 pass
             self._close_bg()
-        return 7 if getattr(self, "_intentional_exit", False) else 0
 
     def _sync_cookies(self, ctx):
         """
