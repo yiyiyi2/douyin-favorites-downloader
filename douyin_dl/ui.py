@@ -26,6 +26,251 @@ import requests
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
 
+# --------------------------------------------------------------- 播放器置前
+# 我们是以 pythonw 后台进程的身份调 os.startfile 打开视频的, Windows 只会让
+# "本来就在前台"的进程把前台权限传给子进程。所以播放器虽然起来了, 窗口却留在
+# 后面, 用户还得自己去任务栏点一下。下面这几个函数就是补这一步。
+
+# 常见播放器的进程名(小写)。命中就可以直接认出来是播放器窗口。
+_MEDIA_PROC_NAMES = {
+    "microsoft.media.player.exe",   # Win11 自带"媒体播放器"
+    "wmplayer.exe",                  # 旧版 Windows Media Player
+    "vlc.exe",
+    "potplayermini64.exe",
+    "potplayermini.exe",
+    "potplayer64.exe",
+    "mpc-hc64.exe",
+    "mpc-be64.exe",
+    "mpv.exe",
+    "kmplayer.exe",
+    "kmplayer64.exe",
+    "qqplayer.exe",
+    "stormplayer.exe",
+    "nplayer.exe",
+}
+
+
+def _win_list() -> list[dict]:
+    """列出所有"可见且有标题"的顶层窗口 -> [{hwnd, pid, title}]。
+
+    纯 user32 查询, pythonw 没有自己的窗口也照样能调。
+    """
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+    except OSError:
+        return []
+
+    found: list[dict] = []
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(hwnd, _lparam):
+        try:
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            n = user32.GetWindowTextLengthW(hwnd)
+            if n <= 0:
+                return True
+            buf = ctypes.create_unicode_buffer(n + 1)
+            user32.GetWindowTextW(hwnd, buf, n + 1)
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            found.append({"hwnd": int(hwnd), "pid": int(pid.value),
+                          "title": buf.value})
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumWindows(proto(_cb), 0)
+    except Exception:
+        return found
+    return found
+
+
+def _proc_name(pid: int) -> str:
+    """pid -> 可执行文件名(小写); 拿不到返回空串。"""
+    if os.name != "nt" or pid <= 0:
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return ""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    try:
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    except Exception:
+        return ""
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buf.value).lower()
+    except Exception:
+        return ""
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _force_foreground(hwnd: int) -> bool:
+    """把指定窗口拉到最前面; 已经是前台就返回 True。
+
+    后台进程直接 SetForegroundWindow 会被系统的"前台锁"拒绝, 所以:
+      1) 先把当前线程输入挂到前台窗口所在线程上 (AttachThreadInput);
+      2) 再补一次 Alt 键事件 —— 系统会认为用户有输入, 临时放开限制。
+    这两招缺一个在某些场景下就不生效, 所以一起用。
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    import ctypes
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except OSError:
+        return False
+
+    SW_RESTORE, SW_SHOW = 9, 5
+    try:
+        user32.ShowWindow(hwnd, SW_RESTORE if user32.IsIconic(hwnd) else SW_SHOW)
+    except Exception:
+        pass
+
+    cur_tid = int(kernel32.GetCurrentThreadId())
+    try:
+        fg = int(user32.GetForegroundWindow() or 0)
+    except Exception:
+        fg = 0
+    if fg == hwnd:
+        return True
+
+    attached: list[int] = []
+    for tid in {int(user32.GetWindowThreadProcessId(fg, None) or 0) if fg else 0,
+                int(user32.GetWindowThreadProcessId(hwnd, None) or 0)}:
+        if tid and tid != cur_tid:
+            try:
+                if user32.AttachThreadInput(cur_tid, tid, True):
+                    attached.append(tid)
+            except Exception:
+                pass
+
+    VK_MENU, KEYEVENTF_KEYUP = 0x12, 0x0002
+    try:
+        user32.keybd_event(VK_MENU, 0, 0, 0)
+        user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    except Exception:
+        pass
+    finally:
+        for tid in attached:
+            try:
+                user32.AttachThreadInput(cur_tid, tid, False)
+            except Exception:
+                pass
+
+    try:
+        return int(user32.GetForegroundWindow() or 0) == hwnd
+    except Exception:
+        return False
+
+
+def _hosted_media(hwnd: int, cache: dict[int, str]) -> bool:
+    """ApplicationFrameHost 的窗口里装的是不是播放器。
+
+    Win11 的「媒体播放器」「电影和电视」都是 AppX 应用: 真正显示给你看的那层
+    窗口属于 applicationframehost.exe, 播放器进程躲在里面当子窗口。所以只能
+    顺着子窗口去查进程名, 否则会认不出来。
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+    except OSError:
+        return False
+
+    hit = {"yes": False}
+    proto = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def _cb(child, _lparam):
+        pid = wintypes.DWORD(0)
+        try:
+            user32.GetWindowThreadProcessId(child, ctypes.byref(pid))
+        except Exception:
+            return True
+        p = int(pid.value)
+        if p not in cache:
+            cache[p] = _proc_name(p)
+        if cache[p] in _MEDIA_PROC_NAMES:
+            hit["yes"] = True
+            return False
+        return True
+
+    try:
+        user32.EnumChildWindows(hwnd, proto(_cb), 0)
+    except Exception:
+        return False
+    return hit["yes"]
+
+
+def _activate_player(before: set[int], stem: str, timeout: float = 8.0) -> bool:
+    """等播放器窗口出现, 然后把它拉到前台。
+
+    before: 点"打开"之前的窗口句柄集合, 用来区分"新弹出来的"和"原本就在的"。
+            播放器已经在跑时不会再开新窗口, 这时就直接把那个旧窗口提上来。
+    stem:   视频文件名(不含扩展名), 标题里带它的窗口优先 —— 一个播放器开多个
+            窗口时能挑对。
+    """
+    deadline = time.time() + timeout
+    hint = (stem or "").strip().lower()[:12]
+    name_cache: dict[int, str] = {}
+
+    while time.time() < deadline:
+        wins = _win_list()
+        if wins:
+            named = []
+            for w in wins:
+                pid = w["pid"]
+                if pid not in name_cache:
+                    name_cache[pid] = _proc_name(pid)
+                pname = name_cache[pid]
+                if pname in _MEDIA_PROC_NAMES:
+                    named.append(w)
+                elif pname == "applicationframehost.exe" and _hosted_media(w["hwnd"], name_cache):
+                    named.append(w)
+
+            fresh = [w for w in named if w["hwnd"] not in before]
+            pool = fresh or named
+            if not pool:
+                # 认不出来的播放器(小众播放器/被关联到别的程序): 退一步,
+                # 本次操作之后新冒出来的窗口大概率就是它。
+                pool = [w for w in wins if w["hwnd"] not in before]
+
+            if pool:
+                pool.sort(key=lambda w: 0 if (hint and hint in w["title"].lower()) else 1)
+                for w in pool[:3]:
+                    if _force_foreground(w["hwnd"]):
+                        return True
+        time.sleep(0.25)
+    return False
+
+
 def _make_blank_png(size: int = 1, rgb: tuple[int, int, int] = (26, 32, 44)) -> bytes:
     """纯标准库造一张 1x1 深灰 PNG: 老记录没有封面时顶上, 免得控制台刷 404。"""
     def chunk(tag: bytes, data: bytes) -> bytes:
@@ -576,7 +821,16 @@ class _Handler(BaseHTTPRequestHandler):
                         if target.is_dir():
                             os.startfile(str(target))         # noqa: S606 图文作品是目录, 只能开目录
                         else:
+                            before = {w["hwnd"] for w in _win_list()}
                             os.startfile(str(target))         # noqa: S606 用系统默认播放器直接播放视频
+                            # 播放器起来后把它拉到前台, 免得窗口躲在后面还要用户自己点。
+                            # 放线程里做, 不拖慢面板这次的请求。
+                            threading.Thread(
+                                target=_activate_player,
+                                args=(before, target.stem),
+                                name="dy-player-front",
+                                daemon=True,
+                            ).start()
                         return True
             if what == "reveal":
                 aid = str(body.get("id") or "")
