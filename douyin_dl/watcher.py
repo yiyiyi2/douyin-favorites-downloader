@@ -1095,9 +1095,18 @@ class BrowserWatcher:
                             except Exception:
                                 pass
                         self._sync_cookies(ctx)
-                    if tick % 150 == 0:            # 每 ~60 秒: 窗口被关空了就补一个
+                    if tick % 150 == 0:            # 每 ~60 秒: 窗口被关空了看情况补一个
                         try:
                             if not [x for x in ctx.pages if not x.is_closed()]:
+                                # 用户可关掉自动重开: 面板设置里"退出抖音后不再自动打开"
+                                try:
+                                    from douyin_dl.ui import load_settings
+                                    _sr = load_settings(WORKSPACE / ".settings.json").get("auto_reopen", True)
+                                except Exception:
+                                    _sr = True
+                                if not _sr:
+                                    time.sleep(0.4)
+                                    continue
                                 self.log("  浏览器里没有页面了, 重新打开抖音…")
                                 if self._ensure_douyin_tab(ctx) is not None:
                                     reopen_fail = 0

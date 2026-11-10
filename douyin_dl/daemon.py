@@ -41,7 +41,7 @@ def guard():
         t0 = time.time()
         try:
             proc = subprocess.Popen(
-                [_python_exe(), str(MAIN)],
+                [_python_exe(), str(MAIN), "--no-open"],   # 守护拉起不弹面板浏览器, 面板标签还开着会自动重连
                 cwd=str(WORKSPACE),
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
             )
