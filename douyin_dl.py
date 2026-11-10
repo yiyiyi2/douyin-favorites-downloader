@@ -50,6 +50,70 @@ WEB_FILE = WORKSPACE / "douyin_dl" / "web" / "index.html"
 _log_lock = threading.Lock()
 
 
+def refetch_aweme(aid: str, session) -> dict | None:
+    """
+    面板「重试」用: 从调试端口读已登录 Cookie, 用无头浏览器开一次视频详情页,
+    让页面自己发签名请求, 拿最新的 aweme 数据。抓不到返回 None。
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=3):
+            pass
+    except Exception:
+        return None
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return None
+    try:
+        with sync_playwright() as pw:
+            br = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
+            ctx = br.contexts[0]
+            cooked = [{"name": c["name"], "value": c["value"], "domain": c["domain"],
+                       "path": c.get("path", "/")} for c in ctx.cookies()
+                      if "douyin" in (c.get("domain") or "")]
+            br.close()
+        result: dict = {}
+
+        def _grab():
+            with sync_playwright() as pw:
+                hbr = pw.chromium.launch(headless=True, channel="chrome",
+                                         args=["--disable-blink-features=AutomationControlled",
+                                               "--mute-audio", "--no-first-run"])
+                hctx = hbr.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                               "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+                    viewport={"width": 1280, "height": 800}, locale="zh-CN")
+                hctx.add_cookies(cooked)
+                pg = hctx.new_page()
+
+                def on_resp(r):
+                    try:
+                        if "/aweme/detail/" in r.url and result == {}:
+                            d = r.json()
+                            det = (d.get("data") or {}).get("aweme_detail") or d.get("aweme_detail")
+                            if isinstance(det, dict) and (det.get("video") or det.get("images")):
+                                result.update(det)
+                    except Exception:
+                        pass
+                pg.on("response", on_resp)
+                pg.goto(f"https://www.douyin.com/video/{aid}",
+                        wait_until="domcontentloaded", timeout=30000)
+                for _ in range(24):
+                    if result:
+                        break
+                    pg.wait_for_timeout(500)
+                hbr.close()
+
+        import threading as _th
+        t = _th.Thread(target=_grab, daemon=True)
+        t.start()
+        t.join(timeout=45)
+        return dict(result) or None
+    except Exception:
+        return None
+
+
 def log(msg: str = ""):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     with _log_lock:
@@ -146,6 +210,19 @@ class Downloader(threading.Thread):
             finally:
                 self.q.task_done()
 
+    def retry(self, aid: str) -> bool:
+        """面板点重试: 用无头浏览器重新抓一次详情, 抓到就重新入队。"""
+        try:
+            aw = refetch_aweme(aid, self.session)
+        except Exception as e:
+            self.log(f"  ! 重试 {aid} 抓取失败: {e}")
+            return False
+        if not aw:
+            self.log(f"  ! 重试 {aid}: 拿不到视频信息")
+            return False
+        self.q.put((aw, "重试"))
+        return True
+
     def process(self, aweme: dict, source: str):
         info = parse_aweme(aweme)
         if not info.aweme_id:
@@ -178,6 +255,9 @@ class Downloader(threading.Thread):
             self.count_fail += 1
             self._ev("pop_waiting", info.aweme_id)
             self._ev("finish", info.aweme_id, False)
+            self._ev("fail", info.aweme_id, "没有可用的视频地址",
+                     info.desc[:50], info.author,
+                     (info.cover_urls[0] if info.cover_urls else ""))
             return
 
         # 探一下体积, 顺便验证地址可用
@@ -191,7 +271,13 @@ class Downloader(threading.Thread):
         )
 
         stem = build_filename(info)
-        dest = OUT_DIR / f"{stem}.mp4"
+        dest_dir = OUT_DIR
+        # 面板里开了「按作者分文件夹」就归类: downloads/作者名/xxx.mp4
+        if info.author and load_settings(SETTINGS_FILE).get("by_author"):
+            safe = "".join(ch for ch in info.author if ch not in '\\/:*?"<>|').strip() or "未知作者"
+            dest_dir = OUT_DIR / safe[:40]
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{stem}.mp4"
 
         # 已经有同名文件(可能是上次没记进 state)就直接登记
         if dest.exists() and dest.stat().st_size > 0:
@@ -226,12 +312,18 @@ class Downloader(threading.Thread):
             self.log("  × 所有候选地址都下载失败")
             self.count_fail += 1
             self._ev("finish", info.aweme_id, False)
+            self._ev("fail", info.aweme_id, "所有候选地址都下载失败",
+                     info.desc[:50], info.author,
+                     (info.cover_urls[0] if info.cover_urls else ""))
             return
 
         if not verify_video(dest):
             self.log("  × 文件校验失败(可能不是有效视频), 已保留待查")
             self.count_fail += 1
             self._ev("finish", info.aweme_id, False)
+            self._ev("fail", info.aweme_id, "文件校验失败",
+                     info.desc[:50], info.author,
+                     (info.cover_urls[0] if info.cover_urls else ""))
             return
 
         dt = time.time() - t0
@@ -384,9 +476,33 @@ def _acquire_instance_lock():
     try:
         msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
     except OSError:
+        # 锁被占: 先确认是不是真的有活进程, 别让残留锁挡住正常启动。
+        # (文件锁理论上随进程消失, 但进程被强杀时偶尔会留下死锁文件)
+        if not _has_live_watcher():
+            try:
+                os.close(fd)
+                os.remove(str(WORKSPACE / ".watcher.lock"))
+                fd = os.open(str(WORKSPACE / ".watcher.lock"), os.O_RDWR | os.O_CREAT)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return fd
+            except OSError:
+                pass
         os.close(fd)
         return None
     return fd
+
+
+def _has_live_watcher() -> bool:
+    """有没有真的 douyin_dl.py 进程在跑(按命令行匹配, 不看锁文件)。"""
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["wmic", "process", "where", "name='python.exe'", "get", "commandline"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.lower()
+        return "douyin_dl.py" in out
+    except Exception:
+        return False  # 探测失败时保守认为没有, 允许覆盖残留锁
 
 
 _LOCK = None
@@ -447,6 +563,7 @@ def main():
 
     dl = Downloader(state, session, bus=bus)
     dl.start()
+    bus.on_retry = dl.retry          # 面板「重试」按钮 -> 重新抓详情再入队
 
     watcher = BrowserWatcher(
         profile_dir=PROFILE_DIR,

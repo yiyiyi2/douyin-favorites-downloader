@@ -103,6 +103,8 @@ class EventBus:
         self.active: dict[str, dict] = {}
         self.waiting: list[dict] = []
         self.counters = {"ok": 0, "skip": 0, "fail": 0}
+        self.failed: dict[str, dict] = {}          # aid -> {title, author, cover, why, time}
+        self.on_retry = None                        # callable(aid) | None, 由主程序注入
         self.status = {"running": False, "browser": "", "note": ""}
         self.started = time.time()
         self.max_speed = 0.0
@@ -210,6 +212,31 @@ class EventBus:
             self.counters["skip"] += 1
         self.publish()
 
+    def fail(self, aid: str, why: str, title: str = "", author: str = "", cover: str = ""):
+        """下载失败: 记进失败列表, 面板上可以一键重试。"""
+        with self.lock:
+            self.failed[str(aid)] = {
+                "id": str(aid), "why": why, "title": title, "author": author,
+                "cover": cover, "time": int(time.time()),
+            }
+            self.failed = dict(list(self.failed.items())[-50:])   # 最多留 50 条
+        self.publish()
+
+    def retry(self, aid: str) -> bool:
+        """把失败的那条重新交给下载器; 返回是否成功入队。"""
+        fn = self.on_retry
+        if not fn:
+            return False
+        try:
+            ok = fn(str(aid))
+        except Exception:
+            ok = False
+        if ok:
+            with self.lock:
+                self.failed.pop(str(aid), None)
+            self.publish()
+        return ok
+
     def set_speed(self, mbps: float):
         with self.lock:
             if mbps > self.max_speed:
@@ -282,6 +309,7 @@ class EventBus:
             "counters": counters,
             "active": active,
             "waiting": waiting,
+            "failed": list(self.failed.values()),
             "recent": recent[:300],
             "total": len(recent),
             "today": sum(1 for x in recent if (x.get("time") or 0) >= today0),
@@ -290,6 +318,7 @@ class EventBus:
             "quality": self._quality,
             "quality_choices": QUALITY_CHOICES,
             "out_dir": str(self.out_dir),
+            "by_author": bool(load_settings(self.workspace / ".settings.json").get("by_author")),
         }
 
     @property
@@ -390,7 +419,19 @@ class _Handler(BaseHTTPRequestHandler):
             aid = (qs.get("id") or [""])[0]
             data = self.bus.thumb(aid) if aid else None
             # 没有封面时回一张 1x1 灰色图, 免得浏览器控制台刷一堆 404
-            self._bytes(data or _BLANK_IMG, "image/png", cache=bool(data))
+            if not data:
+                data, ctype = _BLANK_IMG, "image/png"
+            elif data[:3] == b"\xff\xd8\xff":       # JPEG 魔数
+                ctype = "image/jpeg"
+            elif data[:4] == b"\x89PNG":
+                ctype = "image/png"
+            elif data[:6] in (b"GIF87a", b"GIF89a"):
+                ctype = "image/gif"
+            elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                ctype = "image/webp"
+            else:
+                ctype = "application/octet-stream"
+            self._bytes(data, ctype, cache=bool(data and data is not _BLANK_IMG))
             return
 
         if path == "/api/log":
@@ -450,12 +491,57 @@ class _Handler(BaseHTTPRequestHandler):
             cur = load_settings(path)
             if body.get("quality") in QUALITY_CHOICES:
                 cur["quality"] = body["quality"]
+            if isinstance(body.get("by_author"), bool):
+                cur["by_author"] = body["by_author"]
             save_settings(path, cur)
             self.bus.publish()
             self._json({"ok": True, "settings": cur})
             return
 
+        if u.path == "/api/retry":
+            ok = self.bus.retry(str(body.get("id") or ""))
+            self._json({"ok": ok})
+            return
+
+        if u.path == "/api/delete":
+            self._json({"ok": self._delete(body)})
+            return
+
         self._json({"error": "not found"}, 404)
+
+    def _delete(self, body: dict) -> bool:
+        """从面板删掉一条记录: 删 mp4/图文文件 + _meta + .state.json 条目 + 缩略图。"""
+        aid = str(body.get("id") or "")
+        if not aid:
+            return False
+        removed = False
+        try:
+            for x in self.bus._recent():
+                if x.get("id") != aid:
+                    continue
+                f = x.get("file")
+                if f:
+                    t = self.bus.workspace / f
+                    if t.is_file():
+                        t.unlink(); removed = True
+                    d = t.parent / "_meta" / f"{aid}.json"
+                    if d.is_file():
+                        d.unlink()
+                removed = True
+            st = self.bus.state_file
+            if st.exists():
+                data = json.loads(st.read_text(encoding="utf-8"))
+                if aid in data:
+                    data.pop(aid, None)
+                    st.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            th = self.bus.thumbs_dir / f"{aid}.jpg"
+            if th.exists():
+                th.unlink()
+            self.bus._recent_cache = None
+            self.bus.publish()
+        except Exception:
+            return removed
+        return removed
 
     def _open(self, body: dict) -> bool:
         what = body.get("what")

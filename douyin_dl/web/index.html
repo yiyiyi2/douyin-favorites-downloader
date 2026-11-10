@@ -83,6 +83,33 @@
   .qitem{background:var(--panel);border:1px dashed #2b3444;border-radius:10px;padding:6px 10px;font-size:12px;
          color:var(--muted);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
+  /* 失败列表 */
+  .failed-list{display:flex;flex-direction:column;gap:8px}
+  .fitem{background:var(--panel);border:1px solid #3a2530;border-radius:12px;padding:10px 14px;
+         display:flex;gap:12px;align-items:center}
+  .fitem .meta{color:#c76a7e;font-size:12px;margin-top:2px}
+  .btn{padding:5px 12px;border-radius:9px;font-size:12px}
+  button.danger{color:#ff8095;border-color:#3a2530}
+  button.danger:hover{background:#2a1a20;border-color:#57303e}
+
+  /* 近 14 天柱状图 */
+  .chart{display:flex;align-items:flex-end;gap:8px;height:110px;padding:8px 12px;
+         background:var(--panel);border:1px solid var(--line);border-radius:14px}
+  .chart .col{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;
+              height:100%;min-width:0;position:relative}
+  .chart .fill{width:70%;max-width:34px;border-radius:6px 6px 2px 2px;
+               background:linear-gradient(180deg,var(--red),#8a1f36);min-height:3px;transition:height .3s}
+  .chart .col:hover .fill{background:var(--cyan)}
+  .chart .col span{position:absolute;top:-2px;font-size:10px;color:var(--muted)}
+  .chart .col em{font-style:normal;font-size:10px;color:#5a6478;margin-top:6px}
+
+  /* 右键菜单 */
+  #ctxmenu{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:6px;
+           min-width:170px;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+  #ctxmenu .mi{padding:8px 12px;border-radius:8px;cursor:pointer;font-size:13px;white-space:nowrap}
+  #ctxmenu .mi:hover{background:var(--panel-2)}
+  #ctxmenu .mi.danger{color:#ff8095}
+
   /* 工具栏 */
   .toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
   .search{flex:1;min-width:200px;position:relative}
@@ -199,6 +226,16 @@
     <div class="queue" id="queue"></div>
   </div>
 
+  <div id="failedWrap" style="display:none">
+    <h2>下载失败 <span style="color:#4a5568;font-size:12px">点「重试」会重新抓取最新地址再下</span></h2>
+    <div class="failed-list" id="failed"></div>
+  </div>
+
+  <div id="chartWrap" style="display:none">
+    <h2>近 14 天下载量</h2>
+    <div class="chart" id="chart"></div>
+  </div>
+
   <h2>下载记录 <span id="cnt" style="color:#4a5568;font-size:12px"></span></h2>
   <div class="toolbar">
     <div class="search">
@@ -234,6 +271,13 @@
   <div class="field">
     <label>下载画质</label>
     <div class="radios" id="qualityRadios"></div>
+  </div>
+  <div class="field">
+    <label>按作者分文件夹</label>
+    <div class="radios" id="byAuthorRadios">
+      <label class="radio" data-k="0"><input type="radio" name="ba" onchange="setByAuthor(0)"> 关（全部放 downloads/）</label>
+      <label class="radio" data-k="1"><input type="radio" name="ba" onchange="setByAuthor(1)"> 开（downloads/作者名/）</label>
+    </div>
   </div>
   <div class="field">
     <label>下载目录</label>
@@ -290,7 +334,19 @@ function thumbHtml(item){
   const ph = `<div class="ph">${ch}</div>`;
   if(!item.id) return ph;
   const src = "/api/thumb?id=" + encodeURIComponent(item.id);
-  return ph + `<img loading="lazy" src="${src}" onerror="this.style.display='none'">`;
+  // 加载失败时自动重试(最多 5 次, 间隔递增) —— 新记录封面要等服务端去抖音现拉, 第一次容易超时
+  return ph + `<img loading="lazy" src="${src}" onerror="thumbRetry(this)">`;
+}
+
+function thumbRetry(img){
+  const n = (parseInt(img.dataset.rv || "0", 10)) + 1;
+  if(n > 5){ img.style.display = "none"; return; }
+  img.dataset.rv = String(n);
+  setTimeout(() => {
+    if(!img.isConnected) return;
+    img.style.display = "";
+    img.src = img.src.split("&rv=")[0] + "&rv=" + n;
+  }, 1200 * n);
 }
 
 // ---------- 渲染 ----------
@@ -337,6 +393,21 @@ function render(){
   $("queue").innerHTML = wait.map(w=>
     `<div class="qitem" title="${esc(w.title)}">⏳ ${esc(w.title||w.id)}</div>`).join("");
 
+  // 失败列表
+  const fails = STATE.failed || [];
+  $("failedWrap").style.display = fails.length ? "" : "none";
+  $("failed").innerHTML = fails.map(f=>
+    `<div class="fitem">
+       <div style="min-width:0;flex:1">
+         <div class="t" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.title||f.id)}</div>
+         <div class="meta">${esc(f.why||"未知原因")} · ${fmtTime(f.time)}</div>
+       </div>
+       <button class="btn" onclick="retryDl('${esc(f.id)}')">重试</button>
+     </div>`).join("");
+
+  // 近 14 天柱状图
+  drawChart(STATE.recent || []);
+
   // 历史
   let list = (STATE.recent||[]).slice();
   const q = $("q").value.trim().toLowerCase();
@@ -357,7 +428,7 @@ function render(){
 
   $("cnt").textContent = list.length ? `(${list.length})` : "";
   $("grid").innerHTML = list.map(x=>`
-    <div class="card" ondblclick="openWhat('file','${x.id}')">
+    <div class="card" id="card-${x.id}" ondblclick="openWhat('file','${x.id}')" oncontextmenu="showMenu(event,'${x.id}');return false">
       <div class="thumb">
         ${thumbHtml(x)}
         ${x.type==="images"?`<span class="tag">图文</span>`:""}
@@ -372,6 +443,7 @@ function render(){
           <button onclick="openWhat('file','${x.id}')">打开</button>
           <button onclick="openWhat('reveal','${x.id}')">定位</button>
           <button onclick="copyLink('${x.id}')">链接</button>
+          <button class="danger" onclick="delRec('${x.id}')">删除</button>
         </div>
       </div>
     </div>`).join("");
@@ -395,7 +467,90 @@ function render(){
     $("qualityRadios").dataset.ready = "1";
   }
   $("outdir").textContent = STATE.out_dir || "—";
+
+  // 「按作者分文件夹」单选状态
+  if(!$("byAuthorRadios").dataset.ready){
+    const on = STATE.by_author ? 1 : 0;
+    [...$("byAuthorRadios").children].forEach(l=>{
+      l.classList.toggle("on", +l.dataset.k === on);
+      l.querySelector("input").checked = (+l.dataset.k === on);
+    });
+    $("byAuthorRadios").dataset.ready = "1";
+  } else {
+    const on = STATE.by_author ? 1 : 0;
+    [...$("byAuthorRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === on));
+  }
 }
+
+// 近 14 天下载量柱状图(纯 CSS)
+function drawChart(recent){
+  const days = [];
+  const now = new Date(); now.setHours(0,0,0,0);
+  for(let i=13;i>=0;i--){
+    const t0 = now.getTime()/1000 - i*86400;
+    days.push({t0, t1:t0+86400, n:0});
+  }
+  (recent||[]).forEach(x=>{
+    const d = days.find(d=>(x.time||0)>=d.t0 && (x.time||0)<d.t1);
+    if(d) d.n++;
+  });
+  const max = Math.max(1, ...days.map(d=>d.n));
+  $("chartWrap").style.display = "";
+  $("chart").innerHTML = days.map(d=>{
+    const h = Math.round(d.n/max*100);
+    return `<div class="col" title="${fmtDay(d.t0)}: ${d.n} 个">
+      <div class="fill" style="height:${Math.max(d.n?8:2,h)}%"></div>
+      <span>${d.n||""}</span><em>${new Date(d.t0*1000).getMonth()+1}/${new Date(d.t0*1000).getDate()}</em>
+    </div>`;
+  }).join("");
+}
+
+// 失败重试
+async function retryDl(aid){
+  const r = await fetch("/api/retry", {method:"POST", headers:{"Content-Type":"application/json"},
+                                       body: JSON.stringify({id: aid})});
+  const j = await r.json();
+  toast(j.ok ? "已重新排队" : "重试失败", j.ok ? "正在抓取最新视频地址…" : "稍后再试或看日志");
+}
+
+// 删除记录(文件+记录一起删)
+async function delRec(aid){
+  if(!confirm("确定删除这个视频的文件和下载记录吗？")) return;
+  const r = await fetch("/api/delete", {method:"POST", headers:{"Content-Type":"application/json"},
+                                       body: JSON.stringify({id: aid})});
+  const j = await r.json();
+  toast(j.removed ? "已删除" : "删除失败", j.removed ? "文件和记录都清掉了" : "文件可能已经不在了");
+}
+
+// 设置: 按作者分文件夹
+async function setByAuthor(v){
+  await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"},
+                                body: JSON.stringify({by_author: !!v})});
+  [...$("byAuthorRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
+  toast(v ? "已开启按作者分文件夹" : "已关闭按作者分文件夹",
+        v ? "新下载会存到 downloads/作者名/" : "新下载全部放 downloads/");
+}
+
+// 右键菜单
+function showMenu(ev, aid){
+  ev.preventDefault();
+  closeMenu();
+  const m = document.createElement("div");
+  m.id = "ctxmenu";
+  m.style.cssText = "position:fixed;left:" + Math.min(ev.clientX, innerWidth-180) + "px;top:"
+                  + Math.min(ev.clientY, innerHeight-170) + "px;z-index:999";
+  m.innerHTML = `
+    <div class="mi" onclick="openWhat('file','${aid}');closeMenu()">▶ 打开视频</div>
+    <div class="mi" onclick="openWhat('reveal','${aid}');closeMenu()">📁 打开所在文件夹</div>
+    <div class="mi" onclick="copyLink('${aid}');closeMenu()">🔗 复制视频链接</div>
+    <div class="mi danger" onclick="delRec('${aid}');closeMenu()">🗑 删除记录和文件</div>`;
+  document.body.appendChild(m);
+}
+function closeMenu(){
+  const old = document.getElementById("ctxmenu");
+  if(old) old.remove();
+}
+document.addEventListener("click", e=>{ if(!e.target.closest("#ctxmenu")) closeMenu(); });
 
 function toast(title, sub){
   const el = document.createElement("div");
