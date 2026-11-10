@@ -161,35 +161,16 @@
   .field{margin-bottom:18px}
   .field label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px}
   .field .val{font-size:13px;word-break:break-all}
+  .logbox{width:100%;height:240px;resize:vertical;background:#0a0e14;color:#9fb0c6;
+          border:1px solid var(--line);border-radius:10px;padding:10px 12px;
+          font:12px/1.6 Consolas,"Cascadia Mono",monospace;white-space:pre;overflow:auto}
   .radios{display:grid;gap:8px}
   .radio{display:flex;align-items:center;gap:9px;padding:10px 12px;border:1px solid var(--line);
          border-radius:10px;cursor:pointer;background:var(--panel)}
   .radio.on{border-color:var(--red);background:#1b1420}
   .radio input{accent-color:var(--red)}
 
-  /* 日志面板: 悬浮在左上角(避开右上角设置按钮), 可拖动、可拖右下角调大小(记住尺寸/位置) */
-  .logside{position:fixed;left:12px;top:56px;width:380px;height:420px;background:#0c1117;
-           border:1px solid var(--line);box-shadow:var(--shadow);z-index:50;border-radius:12px;
-           display:flex;flex-direction:column;transform:translateX(calc(-100% - 24px));
-           transition:transform .25s ease, visibility 0s linear .25s;visibility:hidden;
-           resize:both;overflow:auto;
-           min-width:260px;min-height:180px;max-width:96vw;max-height:calc(100vh - 70px)}
-  .logside.on{transform:none;visibility:visible;transition:transform .25s ease}
-  .logside .head{display:flex;align-items:center;justify-content:space-between;
-                 padding:10px 14px 8px;border-bottom:1px solid var(--line);cursor:move;user-select:none}
-  .logside .head h2{margin:0;font-size:14px}
-  .logside .head .x{cursor:pointer;color:var(--muted);font-size:18px;line-height:1;padding:2px 8px;border-radius:8px}
-  .logside .head .x:hover{background:#1a2230;color:#fff}
-  .logside .logbox{flex:1;height:auto;border:none;border-radius:0;background:transparent}
-  .logside .tip{font-size:11px;color:var(--muted);padding:0 14px 6px}
-  /* 折叠时的左上角小按钮 */
-  .logfab{position:fixed;left:12px;top:12px;z-index:49;background:#151b24;border:1px solid var(--line);
-          color:var(--muted);border-radius:999px;padding:5px 12px;cursor:pointer;font-size:12px;
-          box-shadow:var(--shadow)}
-  .logfab:hover{color:#fff;border-color:var(--red)}
-  body.logdrag{user-select:none;cursor:move}
-  body.logdrag .logside{pointer-events:none}
-  body.logopen .logfab{display:none}
+  /* 日志: 顶栏「查看日志」抽屉, 见 .drawer 样式 */
 
   /* toast */
   .toasts{position:fixed;right:20px;bottom:20px;display:flex;flex-direction:column;gap:8px;z-index:60}
@@ -279,14 +260,6 @@
   </div>
 </div>
 
-<!-- 日志小窗: 左上角, 拖标题栏移动, 拖右下角调大小 -->
-<div class="logside" id="logside">
-  <div class="head"><h2>运行日志</h2><span class="x" onclick="toggleLog(false)">✕</span></div>
-  <div class="tip">拖标题栏移动 · 拖右下角调大小</div>
-  <div class="logbox" id="logbox">加载中…</div>
-</div>
-<button class="logfab" id="logfab" onclick="toggleLog(true)">☰ 运行日志</button>
-
 <div class="mask" id="mask" onclick="toggleDrawer(false)"></div>
 <div class="drawer" id="drawer">
   <h3>设置</h3>
@@ -319,6 +292,10 @@
       画质设为 1080P/720P 可以省流量和磁盘。<br>
       重复收藏同一个视频不会重复下载。
     </div>
+  </div>
+  <div class="field">
+    <label>运行日志 <span style="color:#8a94a6;font-weight:400;font-size:11px">（最近 200 行 · 每 3 秒刷新）</span></label>
+    <textarea class="logbox" id="logbox" readonly>加载中…</textarea>
   </div>
   <button class="primary" style="width:100%" onclick="toggleDrawer(false)">完成</button>
 </div>
@@ -629,65 +606,9 @@ function toggleDrawer(on){
   $("mask").classList.toggle("on", on);
 }
 function toggleLog(on){
-  // 显式 set(on=false 时移除), 并清理可能残留的拖动状态, 保证点X一定关得掉
-  document.body.classList.remove("logdrag");
-  $("logside").classList.toggle("on", !!on);
-  document.body.classList.toggle("logopen", !!on);
-  if(on) pullLog();
+  // 顶栏「查看日志」: 打开右侧日志抽屉
+  toggleDrawer(!!on);
 }
-// ---- 日志面板: 拖动标题栏移动 + 记住大小/位置 ----
-(function(){
-  const KEY = "logpanel";
-  const p = $("logside");
-  try{
-    const s = JSON.parse(localStorage.getItem(KEY) || "{}");
-    if(s.w) p.style.width  = Math.min(Math.max(s.w,260), innerWidth-24) + "px";
-    if(s.h) p.style.height = Math.min(Math.max(s.h,180), innerHeight-70) + "px";
-    if(s.l != null) p.style.left = Math.min(Math.max(s.l,4), innerWidth-80) + "px";
-    if(s.t != null) p.style.top  = Math.min(Math.max(s.t,8),  innerHeight-60) + "px";
-  }catch(_){}
-  let saveT = null;
-  function remember(){
-    clearTimeout(saveT);
-    saveT = setTimeout(()=>{
-      try{
-        localStorage.setItem(KEY, JSON.stringify({
-          w:p.offsetWidth, h:p.offsetHeight,
-          l:parseFloat(p.style.left)||12, t:parseFloat(p.style.top)||56
-        }));
-      }catch(_){}
-    }, 300);
-  }
-  p.addEventListener("mouseup", remember);
-  window.addEventListener("resize", ()=>{
-    const l = parseFloat(p.style.left)||12, t = parseFloat(p.style.top)||56;
-    p.style.left = Math.min(Math.max(l,4), innerWidth-80) + "px";
-    p.style.top  = Math.min(Math.max(t,8),  innerHeight-60) + "px";
-  });
-  const head = p.querySelector(".head");
-  head.addEventListener("mousedown", (e)=>{
-    if(e.target.closest(".x")) return;              // 点 ✕ 不拖动
-    e.preventDefault();
-    const sx = e.clientX, sy = e.clientY;
-    const r0 = p.getBoundingClientRect();
-    const offL = r0.left, offT = r0.top;
-    p.style.transition = "none";                    // 拖动时禁用过渡, 松手恢复
-    document.body.classList.add("logdrag");
-    function mv(ev){
-      p.style.left = Math.min(Math.max(offL + (ev.clientX-sx), 4), innerWidth-80) + "px";
-      p.style.top  = Math.min(Math.max(offT + (ev.clientY-sy), 8), innerHeight-60) + "px";
-    }
-    function up(){
-      document.removeEventListener("mousemove", mv);
-      document.removeEventListener("mouseup", up);
-      p.style.transition = "";
-      document.body.classList.remove("logdrag");
-      remember();
-    }
-    document.addEventListener("mousemove", mv);
-    document.addEventListener("mouseup", up);
-  });
-})();
 async function openWhat(what, id){
   await fetch("/api/open", {method:"POST", headers:{"Content-Type":"application/json"},
                             body: JSON.stringify({what, id})});
@@ -720,10 +641,11 @@ connect();
 
 // 日志
 async function pullLog(){
+  const box = $("logbox");
+  if(!box) return;
   try{
     const r = await fetch("/api/log?lines=200");
     const d = await r.json();
-    const box = $("logbox");
     const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 30;
     box.textContent = (d.lines || []).join("\n");
     if(atBottom) box.scrollTop = box.scrollHeight;

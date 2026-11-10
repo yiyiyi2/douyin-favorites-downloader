@@ -574,9 +574,9 @@ class _Handler(BaseHTTPRequestHandler):
                     if x["id"] == aid and x.get("file"):
                         target = self.bus.workspace / x["file"]
                         if target.is_dir():
-                            os.startfile(str(target))         # noqa: S606
+                            os.startfile(str(target))         # noqa: S606 图文作品是目录, 只能开目录
                         else:
-                            subprocess.Popen(["explorer", "/select,", str(target)])
+                            os.startfile(str(target))         # noqa: S606 用系统默认播放器直接播放视频
                         return True
             if what == "reveal":
                 aid = str(body.get("id") or "")
