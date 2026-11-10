@@ -621,15 +621,19 @@ def main():
     else:
         watcher.download_all_on_start = False
 
+    rc = 0
     try:
-        watcher.run()
+        rc = watcher.run()
+        if rc == 7:
+            # 用户主动关闭(自动重开=关 且抖音全部关闭): 让 daemon 知道别再拉起
+            log("  已按设置停止监听。下次双击 启动收藏下载.bat 再开始。")
     except KeyboardInterrupt:
         pass
     finally:
         log("")
         log(f"  本次统计: 成功 {dl.count_ok} · 跳过 {dl.count_skip} · 失败 {dl.count_fail}")
         log(f"  文件在: {OUT_DIR}")
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
