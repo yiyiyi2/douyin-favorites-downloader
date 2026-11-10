@@ -568,9 +568,6 @@ class _Handler(BaseHTTPRequestHandler):
             if what == "folder":
                 os.startfile(str(self.bus.out_dir))          # noqa: S606
                 return True
-            if what == "douyin":
-                os.startfile("https://www.douyin.com/")      # noqa: S606
-                return True
             if what == "file":
                 aid = str(body.get("id") or "")
                 for x in self.bus._recent():
