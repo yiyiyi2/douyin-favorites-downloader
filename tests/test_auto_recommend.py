@@ -117,6 +117,7 @@ def test_recommend_source_prefetches_detail(monkeypatch):
     dl.log = lambda *a, **k: None
     dl.count_skip = 0
     dl.count_fail = 0
+    dl._rec_prefetch = {}
 
     feed_aweme = {"aweme_id": "777", "desc": "feed版本", "video": {}}
     dl.process(feed_aweme, "推荐页")

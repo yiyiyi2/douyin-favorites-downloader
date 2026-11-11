@@ -81,6 +81,17 @@ def refetch_aweme(aid: str, session) -> dict | None:
     面板「重试」用: 从调试端口读已登录 Cookie, 用无头浏览器开一次视频详情页,
     让页面自己发签名请求, 拿最新的 aweme 数据。抓不到返回 None。
     """
+    # 同一时刻只允许一个无头浏览器在抓详情: 下载是多线程的,
+    # 并发各起一个 chromium 会互相拖慢(资源抖动/超时), 之前推荐页批量入队时
+    # 一半抓不到就是这个原因。全局锁串行化, 每次抓取反而更快更稳。
+    with _refetch_lock:
+        return _refetch_aweme_locked(aid)
+
+
+_refetch_lock = threading.Lock()
+
+
+def _refetch_aweme_locked(aid: str) -> dict | None:
     import urllib.request
     try:
         with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=3):
@@ -231,6 +242,7 @@ class Downloader(threading.Thread):
         self.count_ok = 0
         self.count_skip = 0
         self.count_fail = 0
+        self._rec_prefetch: dict[str, int] = {}   # 推荐页详情预取的重试计数
 
     # -- 面板事件小工具 ------------------------------------------------
     def _ev(self, name, *a):
@@ -287,19 +299,37 @@ class Downloader(threading.Thread):
         # 推荐页(feed/related)列表里的候选 URL 带 ply_type=4&tk=webid,
         # 是页面播放器的内部令牌流, requests 直接下会 403。
         # 必须先走无头浏览器抓一次视频详情页, 换成 detail 接口的可直下 URL。
-        # 抓不到(浏览器没开/详情页失败)才用列表自带的候选硬试。
+        # 抓不到就重新排队等下一轮(最多 3 次), 绝不用列表自带地址硬试 ——
+        # 那些地址带 ply_type=4&tk=webid, 直下必 403, 纯浪费带宽和重试次数。
         if source == "推荐页":
             aid0 = str(aweme.get("aweme_id") or "")
+            tried = self._rec_prefetch.get(aid0, 0)
+            detail = None
             try:
                 detail = refetch_aweme(aid0, self.session)
             except Exception as e:  # noqa: BLE001
-                detail = None
-                self.log(f"  · 推荐页预取详情失败({e}), 用列表自带地址硬试")
+                self.log(f"  · 推荐页预取详情异常({e})")
             if detail:
+                self._rec_prefetch.pop(aid0, None)
                 aweme = detail
                 self.log("  · 已换成详情页地址(可直下)")
-            elif aid0:
-                self.log("  · 没抓到详情, 直接用列表地址试(可能 403)")
+            else:
+                if tried < 2:
+                    # 没抓到: 等 8 秒重新排队, 给下一个视频让出抓取通道
+                    self._rec_prefetch[aid0] = tried + 1
+                    self.log(f"  · 详情抓取没就绪, 8 秒后重新排队({tried + 1}/3)")
+                    self._ev("pop_waiting", aid0)
+                    _th2 = threading.Timer(
+                        8.0, lambda: self.q.put((aweme, "推荐页")))
+                    _th2.daemon = True
+                    _th2.start()
+                    return
+                self._rec_prefetch.pop(aid0, None)
+                self.log("  ! 重试 3 次都没抓到详情, 放弃这个推荐视频(不浪费 403 重试)")
+                self._ev("pop_waiting", aid0)
+                self._ev("fail", aid0, "详情页抓取失败(推荐页)")
+                self.count_fail += 1
+                return
 
         info = parse_aweme(aweme)
         if not info.aweme_id:
