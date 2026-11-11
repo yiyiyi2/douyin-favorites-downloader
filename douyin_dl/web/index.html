@@ -293,7 +293,8 @@
     <div class="chart" id="chart" style="display:none"></div>
   </div>
 
-  <h2>下载记录 <span id="cnt" style="color:#4a5568;font-size:12px"></span></h2>
+  <h2 class="fold" onclick="toggleList()"><span class="arrow" id="listArrow">▾</span>下载记录 <span id="cnt" style="color:#4a5568;font-size:12px"></span></h2>
+  <div id="listBody">
   <div class="toolbar">
     <div class="search">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -317,6 +318,7 @@
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" style="display:none">
     <b>还没有下载记录</b>去抖音点个『收藏』，这里就会实时出现
+  </div>
   </div>
 </div>
 
@@ -410,6 +412,14 @@ function toggleChart(){
   c.style.display = open ? "" : "none";
   if (a) a.textContent = open ? "▾" : "▸";
   if (open) drawChart();
+}
+
+function toggleList(){
+  const b = $("listBody"), a = $("listArrow");
+  if (!b) return;
+  const open = b.style.display === "none";
+  b.style.display = open ? "" : "none";
+  if (a) a.textContent = open ? "▾" : "▸";
 }
 
 function thumbHtml(item){
