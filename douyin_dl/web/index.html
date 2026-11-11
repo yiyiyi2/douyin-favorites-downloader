@@ -344,8 +344,12 @@
     </div>
   </div>
   <div class="field">
-    <label>下载目录</label>
-    <div class="val" id="outdir">—</div>
+    <label>下载目录 <span style="color:#8a94a6;font-weight:400;font-size:11px">（改成其他盘/文件夹后，新视频就存那里）</span></label>
+    <div style="display:flex;gap:8px">
+      <input id="outdirInput" style="flex:1;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px/1.4 Consolas,monospace" spellcheck="false">
+      <button onclick="saveOutdir()">保存</button>
+    </div>
+    <div class="val" id="outdirHint" style="color:#8a94a6;font-size:11px;margin-top:6px"></div>
   </div>
   <div class="field">
     <label>说明</label>
@@ -573,7 +577,12 @@ function render(){
        </label>`).join("");
     $("qualityRadios").dataset.ready = "1";
   }
-  $("outdir").textContent = STATE.out_dir || "—";
+  const oi = $("outdirInput");
+  if(oi && document.activeElement !== oi) oi.value = STATE.out_dir || "";
+  const oh = $("outdirHint");
+  if(oh) oh.textContent = STATE.out_dir_configured
+    ? "当前是自定义目录; 清空保存即恢复默认 " + (STATE.out_dir||"")
+    : "";
 
   // 「按作者分文件夹」单选状态
   if(!$("byAuthorRadios").dataset.ready){
@@ -733,6 +742,15 @@ async function setQuality(k){
   if(!j.ok) return;
   [...$("qualityRadios").children].forEach(l=>l.classList.toggle("on", l.dataset.k===k));
   toast("已切换画质", STATE.quality_choices[k]);
+}
+
+// 设置: 下载目录(可存到其他盘/文件夹)
+async function saveOutdir(){
+  const v = ($("outdirInput").value || "").trim();
+  const j = await api("/api/settings", {out_dir: v});
+  if(!j.ok){ toast("目录没保存", j.error || "目录建不出来或不可写"); return; }
+  toast(v ? "下载目录已更新" : "已恢复默认目录",
+        "新下载的视频会存到: " + (STATE.out_dir || "downloads/"));
 }
 
 // ---------- 快捷键与滚动 ----------

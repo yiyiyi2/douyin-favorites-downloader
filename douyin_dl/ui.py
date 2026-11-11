@@ -510,6 +510,7 @@ class EventBus:
         except Exception:
             state = {}
         meta_dir = self.out_dir / "_meta"
+        meta_dir_default = self.workspace / "downloads" / "_meta"   # 改过下载目录后老元数据还在默认位置
         for aid, row in state.items():
             item = {
                 "id": aid,
@@ -531,6 +532,8 @@ class EventBus:
                 if f.is_dir():
                     item["type"] = "images"
             mp = meta_dir / f"{aid}.json"
+            if not mp.exists():
+                mp = meta_dir_default / f"{aid}.json"
             if mp.exists():
                 try:
                     m = json.loads(mp.read_text(encoding="utf-8"))
@@ -580,6 +583,7 @@ class EventBus:
             "out_dir": str(self.out_dir),
             "by_author": bool(conf.get("by_author")),
             "auto_reopen": bool(conf.get("auto_reopen", True)),
+            "out_dir_configured": bool(conf.get("out_dir")),
         }
 
     @property
@@ -775,6 +779,32 @@ class _Handler(BaseHTTPRequestHandler):
                 cur["by_author"] = body["by_author"]
             if isinstance(body.get("auto_reopen"), bool):
                 cur["auto_reopen"] = body["auto_reopen"]
+            # 下载目录可调: 必须是绝对路径; 相对路径按工作区补全后存。
+            # 建不出来(盘不存在/没权限)就拒绝, 不留下一个下载会悄悄失败的设置。
+            if "out_dir" in body:
+                raw = str(body.get("out_dir") or "").strip()
+                if raw:
+                    p = Path(raw).expanduser()
+                    if not p.is_absolute():
+                        p = (self.bus.workspace / p).resolve()
+                    try:
+                        p.mkdir(parents=True, exist_ok=True)
+                        test = p / ".dy_write_test"
+                        test.write_text("x", encoding="utf-8")
+                        test.unlink()
+                    except Exception:
+                        self._json({"ok": False, "error": "目录建不出来或不可写, 没有保存"})
+                        return
+                    cur["out_dir"] = str(p)
+                    self.bus.out_dir = p          # 面板的「打开文件夹」等立即跟随
+                    try:
+                        (p / "_meta").mkdir(exist_ok=True)
+                    except Exception:
+                        pass
+                else:
+                    # 清空 = 恢复默认 downloads/
+                    cur.pop("out_dir", None)
+                    self.bus.out_dir = self.bus.workspace / "downloads"
             save_settings(path, cur)
             self.bus.publish()
             self._json({"ok": True, "settings": cur})

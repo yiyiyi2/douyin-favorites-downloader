@@ -20,6 +20,13 @@ import threading
 import time
 from pathlib import Path
 
+WORKSPACE = Path(__file__).resolve().parent
+STATE_FILE = WORKSPACE / ".state.json"
+PROFILE_DIR = WORKSPACE / ".chrome_profile"
+LOG_FILE = WORKSPACE / "douyin_dl.log"
+SETTINGS_FILE = WORKSPACE / ".settings.json"
+WEB_FILE = WORKSPACE / "douyin_dl" / "web" / "index.html"
+
 from douyin_dl.ui import (
     EventBus,
     filter_candidates,
@@ -27,6 +34,35 @@ from douyin_dl.ui import (
     save_settings,
     start_ui,
 )
+
+# 下载目录的运行时取值: 设置文件 out_dir > 启动参数 > 工作区/downloads。
+# OUT_DIR 在 main() 里按上面顺序初始化一次; 下载线程里每次都经 get_out_dir() 取,
+# 这样面板里改了目录, 不重启主进程也能对下一个视频生效。
+OUT_DIR = WORKSPACE / "downloads"
+
+
+def get_out_dir() -> Path:
+    try:
+        v = str(load_settings(SETTINGS_FILE).get("out_dir") or "").strip()
+    except Exception:
+        v = ""
+    if not v:
+        return OUT_DIR
+    p = Path(v).expanduser()
+    if not p.is_absolute():
+        p = (WORKSPACE / p).resolve()
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return OUT_DIR          # 目录建不出来(盘不存在/没权限)就还用旧的
+    return p
+
+
+def save_settings_file(path, data):
+    save_settings(path, data)
+
+
+_log_lock = threading.Lock()
 
 from douyin_dl.core import (
     build_filename,
@@ -38,16 +74,6 @@ from douyin_dl.core import (
     verify_video,
     VideoInfo,
 )
-
-WORKSPACE = Path(__file__).resolve().parent
-OUT_DIR = WORKSPACE / "downloads"
-STATE_FILE = WORKSPACE / ".state.json"
-PROFILE_DIR = WORKSPACE / ".chrome_profile"
-LOG_FILE = WORKSPACE / "douyin_dl.log"
-SETTINGS_FILE = WORKSPACE / ".settings.json"
-WEB_FILE = WORKSPACE / "douyin_dl" / "web" / "index.html"
-
-_log_lock = threading.Lock()
 
 
 def refetch_aweme(aid: str, session) -> dict | None:
@@ -305,8 +331,8 @@ class Downloader(threading.Thread):
         )
 
         stem = build_filename(info)
-        dest_dir = OUT_DIR
-        # 面板里开了「按作者分文件夹」就归类: downloads/作者名/xxx.mp4
+        dest_dir = get_out_dir()
+        # 面板里开了「按作者分文件夹」就归类: 下载目录/作者名/xxx.mp4
         if info.author and load_settings(SETTINGS_FILE).get("by_author"):
             safe = "".join(ch for ch in info.author if ch not in '\\/:*?"<>|').strip() or "未知作者"
             dest_dir = OUT_DIR / safe[:40]
@@ -322,7 +348,7 @@ class Downloader(threading.Thread):
             self._ev("skip")
             return
 
-        self.log(f"  下载中 -> downloads/{dest.name}")
+        self.log(f"  下载中 -> {dest_dir.name}/{dest.name}")
         self._ev("begin", info.aweme_id, {
             "title": info.desc[:70] or info.aweme_id,
             "author": info.author,
@@ -395,7 +421,7 @@ class Downloader(threading.Thread):
             ],
             "downloaded_at": int(time.time()),
         }
-        meta_dir = OUT_DIR / "_meta"
+        meta_dir = get_out_dir() / "_meta"
         meta_dir.mkdir(parents=True, exist_ok=True)
         try:
             (meta_dir / f"{info.aweme_id}.json").write_text(
@@ -406,7 +432,7 @@ class Downloader(threading.Thread):
 
     def _save_images(self, info: VideoInfo):
         """图文作品: 逐张下原图。"""
-        folder = OUT_DIR / build_filename(info)
+        folder = get_out_dir() / build_filename(info)
         folder.mkdir(parents=True, exist_ok=True)
         ok = 0
         for i, u in enumerate(info.image_urls, 1):
@@ -580,8 +606,16 @@ def main():
     args = ap.parse_args()
 
     global OUT_DIR
+    # 启动时: 命令行 --output 优先, 其次设置文件里的 out_dir, 最后工作区/downloads
+    settings0 = load_settings(SETTINGS_FILE)
     if args.output:
         OUT_DIR = Path(args.output).resolve()
+        settings0["out_dir"] = str(OUT_DIR)          # 命令行指定时写回设置, 面板能看到
+        save_settings_file(SETTINGS_FILE, settings0)
+    elif settings0.get("out_dir"):
+        OUT_DIR = Path(str(settings0["out_dir"])).expanduser()
+        if not OUT_DIR.is_absolute():
+            OUT_DIR = (WORKSPACE / OUT_DIR).resolve()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     state = State(STATE_FILE)
