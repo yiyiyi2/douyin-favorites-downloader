@@ -34,6 +34,7 @@ from douyin_dl.ui import (
     save_settings,
     start_ui,
 )
+import douyin_dl.ui as ui_mod
 
 # 下载目录的运行时取值: 设置文件 out_dir > 启动参数 > 工作区/downloads。
 # OUT_DIR 在 main() 里按上面顺序初始化一次; 下载线程里每次都经 get_out_dir() 取,
@@ -78,31 +79,40 @@ from douyin_dl.core import (
 
 def refetch_aweme(aid: str, session) -> dict | None:
     """
-    面板「重试」用: 从调试端口读已登录 Cookie, 用无头浏览器开一次视频详情页,
-    让页面自己发签名请求, 拿最新的 aweme 数据。抓不到返回 None。
+    抓一次视频详情的 aweme 数据: 用无头浏览器开视频详情页, 让页面自己发签名请求,
+    拦下 /aweme/detail/ 的响应。抓不到返回 None。
+
+    以前每次调用都新起一个 chromium(启动 1~2 秒 + 加载 + 轮询), 单个视频要 45 秒,
+    排队根本追不上翻页。现在改成常驻一个无头浏览器 + 一个专属线程, 每次只新开一个
+    标签页, 一个视频 2~4 秒。
     """
-    # 同一时刻只允许一个无头浏览器在抓详情: 下载是多线程的,
-    # 并发各起一个 chromium 会互相拖慢(资源抖动/超时), 之前推荐页批量入队时
-    # 一半抓不到就是这个原因。全局锁串行化, 每次抓取反而更快更稳。
     with _refetch_lock:
-        return _refetch_aweme_locked(aid)
+        return _hd_fetch(aid)
 
 
 _refetch_lock = threading.Lock()
 
+# 常驻无头浏览器的请求队列: (aid, cookies, box)
+_hd_q: "queue.Queue" = queue.Queue()
+_hd_lock = threading.Lock()
+_hd_born = False
+_hd_cookie_cache: tuple[float, list] = (0.0, [])
 
-def _refetch_aweme_locked(aid: str) -> dict | None:
+
+def _hd_cookies_from_browser() -> list:
+    """从用户浏览器的调试端口读 douyin cookie。60 秒内复用, 省掉每次 CDP 往返。"""
+    global _hd_cookie_cache
+    ts, cached = _hd_cookie_cache
+    if cached and (time.time() - ts) < 60:
+        return cached
     import urllib.request
     try:
         with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=3):
             pass
     except Exception:
-        return None
+        return cached or []
     try:
         from playwright.sync_api import sync_playwright
-    except Exception:
-        return None
-    try:
         with sync_playwright() as pw:
             br = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
             ctx = br.contexts[0]
@@ -110,45 +120,123 @@ def _refetch_aweme_locked(aid: str) -> dict | None:
                        "path": c.get("path", "/")} for c in ctx.cookies()
                       if "douyin" in (c.get("domain") or "")]
             br.close()
-        result: dict = {}
+        _hd_cookie_cache = (time.time(), cooked)
+        return cooked
+    except Exception:
+        return cached or []
 
-        def _grab():
-            with sync_playwright() as pw:
-                hbr = pw.chromium.launch(headless=True, channel="chrome",
-                                         args=["--disable-blink-features=AutomationControlled",
-                                               "--mute-audio", "--no-first-run"])
-                hctx = hbr.new_context(
+
+def _hd_loop():
+    """专属线程: 持有常驻无头浏览器, 按请求开标签页抓详情。"""
+    from playwright.sync_api import sync_playwright
+    pw = None
+    br = None
+    ctx = None
+    while True:
+        try:
+            aid, cookies, box = _hd_q.get()
+        except Exception:
+            return
+        if aid is None:
+            break
+        page = None
+        try:
+            # 浏览器没起来(第一次/上次崩了)就重建
+            if ctx is None:
+                pw = sync_playwright().start()
+                br = pw.chromium.launch(
+                    headless=True, channel="chrome",
+                    args=["--disable-blink-features=AutomationControlled",
+                          "--mute-audio", "--no-first-run", "--disable-gpu",
+                          "--disable-extensions", "--disable-dev-shm-usage"])
+                ctx = br.new_context(
                     user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                                "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
                     viewport={"width": 1280, "height": 800}, locale="zh-CN")
-                hctx.add_cookies(cooked)
-                pg = hctx.new_page()
+            try:
+                ctx.clear_cookies()
+                if cookies:
+                    ctx.add_cookies(cookies)
+            except Exception:
+                pass
 
-                def on_resp(r):
-                    try:
-                        if "/aweme/detail/" in r.url and result == {}:
-                            d = r.json()
-                            det = (d.get("data") or {}).get("aweme_detail") or d.get("aweme_detail")
-                            if isinstance(det, dict) and (det.get("video") or det.get("images")):
-                                result.update(det)
-                    except Exception:
-                        pass
-                pg.on("response", on_resp)
-                pg.goto(f"https://www.douyin.com/video/{aid}",
-                        wait_until="domcontentloaded", timeout=30000)
-                for _ in range(24):
-                    if result:
-                        break
-                    pg.wait_for_timeout(500)
-                hbr.close()
+            result: dict = {}
 
-        import threading as _th
-        t = _th.Thread(target=_grab, daemon=True)
-        t.start()
-        t.join(timeout=45)
-        return dict(result) or None
-    except Exception:
+            def on_resp(r):
+                try:
+                    if "/aweme/detail/" in r.url and not result:
+                        d = r.json()
+                        det = (d.get("data") or {}).get("aweme_detail") or d.get("aweme_detail")
+                        if isinstance(det, dict) and (det.get("video") or det.get("images")):
+                            result.update(det)
+                except Exception:
+                    pass
+
+            page = ctx.new_page()
+            # 只为了拿 detail 接口的 JSON, 不需要画面:
+            # 拦掉视频/图片/字体/样式等一切大流量资源。页面照样会发 detail 请求,
+            # 但不下载视频本体 —— 省流量, 页面也加载得快得多。
+            def _route(route):
+                try:
+                    u = route.request.url
+                    rt = route.request.resource_type
+                    if (rt in ("media", "image", "font", "stylesheet") or
+                            ".mp4" in u or "douyinvod.com" in u or
+                            "douyinpic.com" in u or ".m3u8" in u):
+                        return route.abort()
+                except Exception:
+                    pass
+                return route.continue_()
+            page.route("**/*", _route)
+            page.on("response", on_resp)
+            page.goto(f"https://www.douyin.com/video/{aid}",
+                      wait_until="domcontentloaded", timeout=20000)
+            # detail 响应通常在页面加载后 1~2 秒内就到; 给 6 秒足够
+            for _ in range(24):
+                if result:
+                    break
+                page.wait_for_timeout(250)
+            box["aweme"] = dict(result) or None
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+            # 浏览器可能已经废了, 下次重建
+            try:
+                if ctx is not None:
+                    ctx.close()
+            except Exception:
+                pass
+            try:
+                if br is not None:
+                    br.close()
+            except Exception:
+                pass
+            ctx = br = None
+        finally:
+            try:
+                if page is not None:
+                    page.close()
+            except Exception:
+                pass
+            box["done"].set()
+
+
+def _hd_fetch(aid: str) -> dict | None:
+    """把抓取请求丢给常驻线程, 等结果。"""
+    global _hd_born
+    with _hd_lock:
+        if not _hd_born:
+            threading.Thread(target=_hd_loop, name="dy-detail-browser", daemon=True).start()
+            _hd_born = True
+    cookies = _hd_cookies_from_browser()
+    if not cookies:
+        return None          # 调试端口没开/没 cookie, 直接失败别浪费时间
+    box = {"done": threading.Event(), "aweme": None, "err": None}
+    _hd_q.put((aid, cookies, box))
+    if not box["done"].wait(timeout=30):
         return None
+    if box.get("err") is not None:
+        return None
+    return box.get("aweme")
 
 
 def log(msg: str = ""):
@@ -744,9 +832,22 @@ def main():
     # v1.4: 自动下推荐页(设置里开关, 默认关)。启动时读设置, 面板改设置时实时切换。
     _conf0 = load_settings(SETTINGS_FILE)
     watcher.auto_recommend = bool(_conf0.get("auto_rec", False))
+    # v1.5: 自动翻页间隔(秒), 设置里可调, 默认 3 秒
+    _clamp_gap = getattr(ui_mod, "_clamp_gap", None)
+    try:
+        watcher.auto_advance_gap = float(_conf0.get("auto_gap") or 3.0)
+    except Exception:
+        watcher.auto_advance_gap = 3.0
+    if _clamp_gap:
+        watcher.auto_advance_gap = _clamp_gap(watcher.auto_advance_gap)
     if watcher.auto_recommend:
-        log("  模式: 自动下载推荐页视频已开启(设置里可随时关)")
+        log(f"  模式: 自动下载推荐页视频已开启(每 {watcher.auto_advance_gap:g} 秒自动翻一条, 设置里可随时关)")
     bus.on_auto_rec = lambda v: setattr(watcher, "auto_recommend", bool(v))
+    bus.on_auto_gap = lambda g: setattr(watcher, "auto_advance_gap", float(g))
+    watcher.auto_advance = bool(_conf0.get("auto_adv", True))
+    bus.on_auto_adv = lambda v: setattr(watcher, "auto_advance", bool(v))
+    # 翻页要有背压: 队列堵了就先别往下滑, 否则积压会无限长
+    watcher.queue_probe = lambda: dl.q.qsize()
 
     rc = 0
     try:

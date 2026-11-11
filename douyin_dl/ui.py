@@ -306,8 +306,21 @@ def _safe_id(v) -> str:
     return s if s.isdigit() and 5 <= len(s) <= 32 else ""
 
 
+def _clamp_gap(v) -> float:
+    """自动翻页间隔: 1~60 秒, 非法值回落到 3 秒。"""
+    try:
+        g = float(v)
+    except Exception:
+        return 3.0
+    if g != g:          # NaN
+        return 3.0
+    return max(1.0, min(60.0, g))
+
+
 def load_settings(path: Path) -> dict:
-    data = {"quality": "max", "open_browser": True, "auto_reopen": True, "by_author": False, "auto_rec": False}
+    data = {"quality": "max", "open_browser": True, "auto_reopen": True,
+            "by_author": False, "auto_rec": False, "auto_gap": 3.0,
+            "auto_adv": True}
     try:
         if path.exists():
             data.update(json.loads(path.read_text(encoding="utf-8")))
@@ -359,6 +372,8 @@ class EventBus:
         self.on_retry = None                        # callable(aid) | None, 由主程序注入
         self.on_delete = None                       # callable(aid) -> bool, 由主程序注入(带锁删记录)
         self.on_auto_rec = None                     # callable(bool), 由主程序注入(实时切换 watcher.auto_recommend)
+        self.on_auto_gap = None                     # callable(float), 由主程序注入(实时改自动翻页间隔)
+        self.on_auto_adv = None                     # callable(bool), 由主程序注入(实时开关自动翻页)
         self.status = {"running": False, "browser": "", "note": ""}
         self.started = time.time()
         self.max_speed = 0.0
@@ -585,6 +600,8 @@ class EventBus:
             "by_author": bool(conf.get("by_author")),
             "auto_reopen": bool(conf.get("auto_reopen", True)),
             "auto_rec": bool(conf.get("auto_rec", False)),
+            "auto_gap": _clamp_gap(conf.get("auto_gap")),
+            "auto_adv": bool(conf.get("auto_adv", True)),
             "out_dir_configured": bool(conf.get("out_dir")),
         }
 
@@ -788,6 +805,28 @@ class _Handler(BaseHTTPRequestHandler):
                 if callable(cb):
                     try:
                         cb(body["auto_rec"])
+                    except Exception:
+                        pass
+            # v1.5: 自动翻页间隔(秒)。1~60 之外一律夹回去, 避免 0 秒疯狂翻页把页面刷崩。
+            if "auto_gap" in body:
+                try:
+                    g = _clamp_gap(body.get("auto_gap"))
+                except Exception:
+                    g = 3.0
+                cur["auto_gap"] = g
+                cb = getattr(self.bus, "on_auto_gap", None)
+                if callable(cb):
+                    try:
+                        cb(g)
+                    except Exception:
+                        pass
+            # v1.5: 自动翻页开关(自动下推荐页开着时才有效)
+            if isinstance(body.get("auto_adv"), bool):
+                cur["auto_adv"] = body["auto_adv"]
+                cb = getattr(self.bus, "on_auto_adv", None)
+                if callable(cb):
+                    try:
+                        cb(body["auto_adv"])
                     except Exception:
                         pass
             # 下载目录可调: 必须是绝对路径; 相对路径按工作区补全后存。

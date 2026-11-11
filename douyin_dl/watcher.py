@@ -427,6 +427,19 @@ class BrowserWatcher:
         # 全部进下载队列(去重), 不只当前刷到的那一条。
         self.auto_recommend = False
         self._auto_submitted: set[str] = set()   # 本会话已提交过的推荐视频, 防重复
+        # 自动翻页间隔(秒)。太小会滑过头来不及下载, 太大会觉得"不动"。
+        # 面板设置里可调, 范围 1~60。
+        # v1.5: 自动替用户翻推荐页(默认开, 但要 auto_recommend 也开着才动作)。
+        # 关掉它就只是"推荐页流量里出现什么就下什么", 不主动滑页面。
+        self.auto_advance = True
+        self.auto_advance_gap = 3.0
+        self._last_advance = 0.0
+        # 队列深度探针(主程序注入 lambda: dl.q.qsize())。
+        # 翻页节奏可以比下载快很多 —— 每翻一次能塞进来 6 个视频,
+        # 而抓详情+下载一个要几秒。积压太多就先停翻, 免得队列越滚越长。
+        self.queue_probe = None
+        self.auto_queue_high = 12      # 积压超过这个数就暂停翻页
+        self._pause_noted = False
         self._lock = threading.Lock()
         self._pending_actions: list[str] = []
         self._page = None
@@ -1125,10 +1138,13 @@ class BrowserWatcher:
                     tick += 1
                     # v1.5: auto_recommend 开着时自动翻推荐页。
                     # 抖音 web 在"停留看当前视频"时不发新 feed 请求, 只有滑到
-                    # 下一条才发一次 /tab/feed(6 条) —— 用户不开就永远没流量,
-                    # 造成"点一下收藏才下一批"的错觉。这里每 ~20 秒替用户滑一次,
-                    # 让推荐流持续产出。用户正在别的页面/全屏时不打扰。
-                    if self.auto_recommend and tick % 50 == 0:
+                    # 下一条才发一次 /tab/feed(6 条) —— 用户不滑就永远没流量,
+                    # 造成"点一下收藏才下一批"的错觉。这里按固定间隔替用户翻页,
+                    # 让推荐流持续产出。用户正在别的页面(搜索/个人主页/详情)时不打扰。
+                    now = time.monotonic()
+                    if (self.auto_recommend and self.auto_advance
+                            and (now - self._last_advance) >= self.auto_advance_gap):
+                        self._last_advance = now
                         self._auto_advance_feed(ctx)
                     if tick % 15 == 0:             # 每 ~6 秒巡检一次钩子是否还在
                         for pg in list(ctx.pages):
@@ -1195,12 +1211,23 @@ class BrowserWatcher:
         免得打扰操作。队列里积压太多时也先不翻, 给下载留时间。
         """
         try:
-            # 队列积压超过 12 个时暂停翻页, 防止越滚越多
-            if self._pending_actions or len(getattr(self, "_resolving", ()) or ()) > 0:
-                pass  # 收藏队列不拦推荐翻页; 推荐自己的积压看 _auto_submitted
-            if len(self._auto_submitted) > 0:
-                # 粗略节流: 提交未消化的比例由下载器自己消化, 这里只管喂
-                pass
+            # 开关自己也要守一道: 面板刚关掉时, 主循环可能还差一拍才停下来
+            if not (self.auto_recommend and self.auto_advance):
+                return
+            # 背压: 下载队列积压太多就先不翻, 等消化一些再继续。
+            # 不这么做的话 3 秒一翻 ≈ 每秒 2 个视频入队, 永远追不上。
+            try:
+                depth = int(self.queue_probe()) if callable(self.queue_probe) else 0
+            except Exception:
+                depth = 0
+            if depth >= self.auto_queue_high:
+                if not self._pause_noted:
+                    self.log(f"  · 队列积压 {depth} 个, 先暂停翻页, 消化完自动继续")
+                    self._pause_noted = True
+                return
+            if self._pause_noted:
+                self.log(f"  · 队列已消化到 {depth} 个, 继续翻页")
+                self._pause_noted = False
             for pg in list(ctx.pages):
                 try:
                     if pg.is_closed():

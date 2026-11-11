@@ -351,6 +351,24 @@
     </div>
   </div>
   <div class="field">
+    <label>自动翻页 <span style="color:#8a94a6;font-weight:400;font-size:11px">(自动替你往下滑，让推荐流持续出片)</span></label>
+    <div class="radios" id="autoAdvRadios">
+      <label class="radio" data-k="0"><input type="radio" name="aav" onchange="setAutoAdv(0)"> 关（推荐页我自己滑）</label>
+      <label class="radio" data-k="1"><input type="radio" name="aav" onchange="setAutoAdv(1)"> 开（自动滑，滑到哪下到哪）</label>
+    </div>
+  </div>
+  <div class="field">
+    <label>自动翻页间隔 <span style="color:#8a94a6;font-weight:400;font-size:11px">（每隔几秒替你滑一条推荐，让推荐流持续出片）</span></label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="gapInput" type="number" min="1" max="60" step="1" value="3"
+             style="width:90px;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px/1.4 Consolas,monospace"
+             spellcheck="false">
+      <span style="color:#8a94a6;font-size:11px">秒（1~60）</span>
+      <button id="gapSave" onclick="saveGap()">保存</button>
+    </div>
+    <div class="val" id="gapHint" style="color:#8a94a6;font-size:11px;margin-top:6px"></div>
+  </div>
+  <div class="field">
     <label>下载目录 <span style="color:#8a94a6;font-weight:400;font-size:11px">（改成其他盘/文件夹后，新视频就存那里）</span></label>
     <div style="display:flex;gap:8px">
       <input id="outdirInput" style="flex:1;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px/1.4 Consolas,monospace" spellcheck="false">
@@ -615,6 +633,22 @@ function render(){
     const on = (STATE.auto_reopen !== false) ? 1 : 0;
     [...$("autoReopenRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === on));
   }
+  // 自动翻页开关
+  {
+    const on = STATE.auto_adv ? 1 : 0;
+    [...$("autoAdvRadios").children].forEach(l=>{
+      l.classList.toggle("on", +l.dataset.k === on);
+      l.querySelector("input").checked = (+l.dataset.k === on);
+    });
+  }
+  // 自动翻页间隔
+  {
+    const gi = $("gapInput");
+    if(gi && document.activeElement !== gi) gi.value = Math.round(STATE.auto_gap || 3);
+    const gh = $("gapHint");
+    if(gh) gh.textContent = !STATE.auto_rec ? "（自动下推荐开着时才生效）"
+                        : (STATE.auto_adv ? `当前每 ${Math.round(STATE.auto_gap||3)} 秒翻一条` : "（自动翻页已关，不会主动滑页面）");
+  }
   // 「自动下载推荐页视频」单选状态
   {
     const on = STATE.auto_rec ? 1 : 0;
@@ -708,6 +742,29 @@ async function setAutoRec(v){
   [...$("autoRecRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
   toast(v ? "已开启自动下推荐" : "已关闭自动下推荐",
         v ? "刷推荐页时加载到的视频会自动进下载队列" : "回到只下收藏的模式");
+}
+
+// 设置: 自动翻页开关
+async function setAutoAdv(v){
+  const j = await api("/api/settings", {auto_adv: !!v});
+  if(!j.ok) return;
+  if(STATE) STATE.auto_adv = !!v;
+  [...$("autoAdvRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
+  toast(v ? "已开启自动翻页" : "已关闭自动翻页",
+        v ? "程序会按间隔替你往下滑推荐流" : "只在你自己滑页面时抓取推荐视频");
+}
+
+// 设置: 自动翻页间隔(秒)
+async function saveGap(){
+  const el = $("gapInput");
+  let v = parseInt(el && el.value, 10);
+  if(!Number.isFinite(v)) v = 3;
+  v = Math.max(1, Math.min(60, v));
+  if(el) el.value = v;
+  const j = await api("/api/settings", {auto_gap: v});
+  if(!j.ok) return;
+  if(STATE) STATE.auto_gap = v;
+  toast(`翻页间隔已设为 ${v} 秒`, v <= 5 ? "节奏较快，注意别把页面刷崩" : "慢一点更稳，磁盘压力也小");
 }
 
 // 右键菜单
