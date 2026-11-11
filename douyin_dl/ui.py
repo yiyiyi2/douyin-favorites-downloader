@@ -299,6 +299,13 @@ QUALITY_CHOICES = {
 # 设置
 # ---------------------------------------------------------------------------
 
+def _safe_id(v) -> str:
+    """抖音的 aweme_id 只会是纯数字。thumb/delete/open 都会把它拼进文件路径,
+    这里统一拦一下, 免得被 ../ 之类的东西穿越出去。"""
+    s = str(v or "").strip()
+    return s if s.isdigit() and 5 <= len(s) <= 32 else ""
+
+
 def load_settings(path: Path) -> dict:
     data = {"quality": "max", "open_browser": True, "auto_reopen": True, "by_author": False}
     try:
@@ -350,6 +357,7 @@ class EventBus:
         self.counters = {"ok": 0, "skip": 0, "fail": 0}
         self.failed: dict[str, dict] = {}          # aid -> {title, author, cover, why, time}
         self.on_retry = None                        # callable(aid) | None, 由主程序注入
+        self.on_delete = None                       # callable(aid) -> bool, 由主程序注入(带锁删记录)
         self.status = {"running": False, "browser": "", "note": ""}
         self.started = time.time()
         self.max_speed = 0.0
@@ -446,6 +454,9 @@ class EventBus:
             rec = self.active.pop(aid, None)
             if ok:
                 self.counters["ok"] += 1
+                # 之前失败过、后来重新收藏/重试成功了, 失败列表里那条得摘掉,
+                # 不然面板永远挂着一个"失败", 用户以为没下好
+                self.failed.pop(str(aid), None)
             else:
                 self.counters["fail"] += 1
             self._recent_cache = None
@@ -547,6 +558,9 @@ class EventBus:
             status = dict(self.status)
             failed = list(self.failed.values())
         recent = self._recent()
+        # 设置文件一次读够: 原来 quality/by_author/auto_reopen 各读一遍,
+        # 每秒推一次快照就是每秒 3 次磁盘读取
+        conf = load_settings(self.workspace / ".settings.json")
         today0 = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
         return {
             "now": int(time.time()),
@@ -561,11 +575,11 @@ class EventBus:
             "today": sum(1 for x in recent if (x.get("time") or 0) >= today0),
             "bytes": sum(x.get("size") or 0 for x in recent),
             "max_speed": self.max_speed,
-            "quality": self._quality,
+            "quality": conf.get("quality") or "max",
             "quality_choices": QUALITY_CHOICES,
             "out_dir": str(self.out_dir),
-            "by_author": bool(load_settings(self.workspace / ".settings.json").get("by_author")),
-            "auto_reopen": bool(load_settings(self.workspace / ".settings.json").get("auto_reopen", True)),
+            "by_author": bool(conf.get("by_author")),
+            "auto_reopen": bool(conf.get("auto_reopen", True)),
         }
 
     @property
@@ -583,6 +597,9 @@ class EventBus:
         return ""
 
     def thumb(self, aid: str) -> bytes | None:
+        aid = _safe_id(aid)
+        if not aid:
+            return None
         p = self.thumbs_dir / f"{aid}.jpg"
         if p.exists() and p.stat().st_size > 0:
             try:
@@ -645,6 +662,12 @@ class _Handler(BaseHTTPRequestHandler):
         path = u.path
         qs = parse_qs(u.query)
 
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if path in ("/", "/index.html"):
             try:
                 html = self.web_file.read_bytes()
@@ -663,7 +686,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/thumb":
-            aid = (qs.get("id") or [""])[0]
+            aid = _safe_id((qs.get("id") or [""])[0])
             data = self.bus.thumb(aid) if aid else None
             # 没封面时回 404(带 no-store), 让前端 thumbRetry 走 onerror 自动重试;
             # 之前回 200 的 1x1 占位图, 浏览器当成加载成功, 就永远不重试了 -> 新下载的没预览图
@@ -758,7 +781,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if u.path == "/api/retry":
-            ok = self.bus.retry(str(body.get("id") or ""))
+            ok = self.bus.retry(_safe_id(body.get("id")))
             self._json({"ok": ok})
             return
 
@@ -770,7 +793,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _delete(self, body: dict) -> bool:
         """从面板删掉一条记录: 删 mp4/图文文件 + _meta + .state.json 条目 + 缩略图。"""
-        aid = str(body.get("id") or "")
+        aid = _safe_id(body.get("id"))
         if not aid:
             return False
         removed = False
@@ -792,12 +815,20 @@ class _Handler(BaseHTTPRequestHandler):
                     if d.is_file():
                         d.unlink()
                 removed = True
-            st = self.bus.state_file
-            if st.exists():
-                data = json.loads(st.read_text(encoding="utf-8"))
-                if aid in data:
-                    data.pop(aid, None)
-                    st.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            # 记录一定要交给主程序删: 下载线程持有 State 的内存副本并整个重写文件,
+            # 面板这边直接改 .state.json 会被它下一次 mark() 覆盖回去(删掉的记录复活)
+            if callable(self.bus.on_delete):
+                try:
+                    self.bus.on_delete(aid)
+                except Exception:
+                    pass
+            else:
+                st = self.bus.state_file
+                if st.exists():
+                    data = json.loads(st.read_text(encoding="utf-8"))
+                    if aid in data:
+                        data.pop(aid, None)
+                        st.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
             th = self.bus.thumbs_dir / f"{aid}.jpg"
             if th.exists():
                 th.unlink()
@@ -814,7 +845,7 @@ class _Handler(BaseHTTPRequestHandler):
                 os.startfile(str(self.bus.out_dir))          # noqa: S606
                 return True
             if what == "file":
-                aid = str(body.get("id") or "")
+                aid = _safe_id(body.get("id"))
                 for x in self.bus._recent():
                     if x["id"] == aid and x.get("file"):
                         target = self.bus.workspace / x["file"]
@@ -833,7 +864,7 @@ class _Handler(BaseHTTPRequestHandler):
                             ).start()
                         return True
             if what == "reveal":
-                aid = str(body.get("id") or "")
+                aid = _safe_id(body.get("id"))
                 for x in self.bus._recent():
                     if x["id"] == aid and x.get("file"):
                         target = self.bus.workspace / x["file"]

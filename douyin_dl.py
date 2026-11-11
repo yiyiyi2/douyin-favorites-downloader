@@ -122,6 +122,15 @@ def log(msg: str = ""):
         except Exception:
             pass   # pythonw 下没有 stdout, print 会抛错; 守护模式全是 pythonw
         try:
+            # 日志只增不减, 跑几个月能把磁盘吃掉。超过 5MB 就滚一份 .1(只留一代)
+            if LOG_FILE.exists() and LOG_FILE.stat().st_size > 5 * 1024 * 1024:
+                bak = LOG_FILE.with_suffix(".log.1")
+                try:
+                    if bak.exists():
+                        bak.unlink()
+                    LOG_FILE.rename(bak)
+                except Exception:
+                    pass
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except Exception:
@@ -149,6 +158,21 @@ class State:
     def has(self, aweme_id: str) -> bool:
         with self.lock:
             return aweme_id in self.done
+
+    def remove(self, aweme_id: str) -> bool:
+        """删一条记录并落盘。面板「删除」走这里, 和 mark() 共用一把锁, 不会互相覆盖。"""
+        with self.lock:
+            if str(aweme_id) not in self.done:
+                return False
+            self.done.pop(str(aweme_id), None)
+            try:
+                self.path.write_text(
+                    json.dumps(self.done, ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+            except Exception:
+                pass
+            return True
 
     def mark(self, aweme_id: str, path: Path, quality: str):
         with self.lock:
@@ -212,6 +236,13 @@ class Downloader(threading.Thread):
                 self.count_fail += 1
             finally:
                 self.q.task_done()
+
+    def delete_record(self, aid: str) -> bool:
+        """面板删除一条记录: 只负责 .state.json, 文件由面板那边删。"""
+        try:
+            return self.state.remove(str(aid))
+        except Exception:
+            return False
 
     def retry(self, aid: str) -> bool:
         """面板点重试: 用无头浏览器重新抓一次详情, 抓到就重新入队。"""
@@ -321,7 +352,12 @@ class Downloader(threading.Thread):
             return
 
         if not verify_video(dest):
-            self.log("  × 文件校验失败(可能不是有效视频), 已保留待查")
+            # 不能留: 下次再下同一视频会命中下面的「已存在, 跳过」, 于是永远是个坏文件
+            self.log("  × 文件校验失败(可能不是有效视频), 已删掉")
+            try:
+                dest.unlink()
+            except Exception:
+                pass
             self.count_fail += 1
             self._ev("finish", info.aweme_id, False)
             self._ev("fail", info.aweme_id, "文件校验失败",
@@ -383,6 +419,7 @@ class Downloader(threading.Thread):
             if download(self.session, u, p, log=self.log):
                 ok += 1
         self.log(f"  ✔ 图文作品: 已保存 {ok}/{len(info.image_urls)} 张 -> {folder.name}/")
+        self._ev("pop_waiting", info.aweme_id)   # 图集不走 begin, 得自己把排队项摘掉
         if ok:
             self.state.mark(info.aweme_id, folder, "images")
             self.count_ok += 1
@@ -590,6 +627,7 @@ def main():
     dl = Downloader(state, session, bus=bus)
     dl.start()
     bus.on_retry = dl.retry          # 面板「重试」按钮 -> 重新抓详情再入队
+    bus.on_delete = dl.delete_record  # 面板「删除」按钮 -> 带锁从 .state.json 摘掉
 
     watcher = BrowserWatcher(
         profile_dir=PROFILE_DIR,
@@ -601,6 +639,7 @@ def main():
         headless=args.headless,
         on_status=lambda kw: bus.set_status(**kw),
     )
+    watcher.on_fail = lambda aid, why: bus.fail(aid, why)   # 抓不到详情也能在面板失败列表里看到
 
     if args.check:
         # 只检查登录: 起浏览器 -> 查 cookie -> 退出

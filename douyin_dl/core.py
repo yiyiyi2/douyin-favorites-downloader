@@ -264,7 +264,13 @@ def download(
             if pos:
                 headers["Range"] = f"bytes={pos}-"
             with session.get(url, stream=True, timeout=30, headers=headers) as r:
-                if r.status_code == 416:  # 已经下完了
+                if r.status_code == 416:
+                    # 416 = 请求的起点已经超出资源长度, 说明 .part 其实已经下完整了。
+                    # 以前这里直接 break, 结果返回 False 并把 .part 留在磁盘上,
+                    # 下次重试还是 416, 这条视频就永远下不下来。
+                    if part.exists() and part.stat().st_size > 0:
+                        part.replace(dest)
+                        return True
                     break
                 r.raise_for_status()
                 mode = "ab" if pos and r.status_code == 206 else "wb"
@@ -289,11 +295,18 @@ def download(
                             pct = f"{done * 100 / (pos + total):5.1f}%" if total else "  ?  "
                             log(f"      {pct}  {done / 1048576:7.1f} MB")
                             last = time.time()
-            if part.exists() and part.stat().st_size > 0:
+            got = part.stat().st_size if part.exists() else 0
+            expect = pos + total          # 206 时 total 只是剩余字节, 要加上已经下好的
+            if total and got < expect:
+                # 连接被中途掐断但没抛异常: 这时 replace 会留下一个后半段是空洞的视频,
+                # verify_video 只看文件头是查不出来的。留着 .part, 下一轮用 Range 续传。
+                log(f"      ! 只下到 {got}/{expect} 字节, 继续重试")
+                time.sleep(1.0)
+                continue
+            if got > 0:
                 if on_progress:
                     try:
-                        final = part.stat().st_size
-                        on_progress(final, final)
+                        on_progress(got, got)
                     except Exception:
                         pass
                 part.replace(dest)

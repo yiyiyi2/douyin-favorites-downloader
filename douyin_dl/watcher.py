@@ -406,6 +406,8 @@ class BrowserWatcher:
         self.port = port
         self.on_aweme = on_aweme or (lambda a, s: None)
         self.on_status = on_status or (lambda kw: None)
+        # (aweme_id, 原因) -> 报给面板失败列表; 主程序会注入
+        self.on_fail: Callable[[str, str], None] | None = None
         self.on_cookie = on_cookie or (lambda c: None)
         self.log = log
         self.headless = headless
@@ -503,30 +505,6 @@ class BrowserWatcher:
             if key in params and params[key] not in ("", "0"):
                 return False
         return True
-
-    def _looks_fresh(self, aw: dict) -> bool:
-        """
-        收藏时间是否就在本次会话期间。
-        没有 collect_time 字段时保守放行(抖音不是每个响应都带)。
-        """
-        for key in ("collect_time", "collect_time_ms", "favorite_time"):
-            v = aw.get(key)
-            if isinstance(v, (int, float)) and v > 0:
-                ts = v / 1000 if v > 1e12 else v
-                return ts >= self.start_time - 300
-        return True
-
-    def _current_video_id(self, href: str) -> str:
-        """从当前页面地址里取「正在看的那个视频」的 id。"""
-        if not href:
-            return ""
-        m = re.search(r"/(?:video|note)/(\d{15,})", href)
-        if m:
-            return m.group(1)
-        m = re.search(r"[?&]modal_id=(\d{15,})", href)
-        if m:
-            return m.group(1)
-        return ""
 
     @staticmethod
     def _parse_body(text: str) -> Any:
@@ -894,6 +872,12 @@ class BrowserWatcher:
                     self.on_aweme(old, "收藏")
                 else:
                     self.log(f"  ! 拿不到 {aid} 的视频信息")
+                    # 必须报到面板: 否则用户点了收藏什么都没发生, 也不知道为什么
+                    if callable(getattr(self, "on_fail", None)):
+                        try:
+                            self.on_fail(aid, "抓不到视频详情(可能已删除/私密/需要登录)")
+                        except Exception:
+                            pass
 
         if self._resolving:                      # 超时: 放回队列下轮再来
             for aid in list(self._resolving):

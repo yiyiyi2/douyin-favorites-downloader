@@ -360,13 +360,14 @@
   <button class="primary" style="width:100%" onclick="toggleDrawer(false)">完成</button>
 </div>
 
-<button class="toTop" id="toTop" title="回到顶部" onclick="scrollTo({top:0,behavior:'smooth'})">↑</button>
+<button class="toTop" id="toTop" title="回到顶部 (T)" onclick="goTop()">↑</button>
 
 <div class="toasts" id="toasts"></div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let STATE = null, FILTER = "all", lastIds = new Set(), firstLoad = true;
+let lastGridSig = "";   // 卡片墙内容指纹, 没变就不重建 DOM
 
 function fmtSize(b){
   if(!b) return "0 MB";
@@ -397,6 +398,11 @@ function ago(ts){
   return (dt.getMonth()+1)+"/"+dt.getDate();
 }
 function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function goTop(){
+  // 注意: 这里必须写 window.scrollTo, 写成 scrollTo 会解析到 Element.prototype.scrollTo
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+
 function toggleChart(){
   const c = $("chart"), a = document.querySelector("#chartWrap .arrow");
   if (!c) return;
@@ -457,7 +463,8 @@ function render(){
   const act = STATE.active || [];
   $("activeWrap").style.display = act.length ? "" : "none";
   $("active").innerHTML = act.map(a=>{
-    const pct = a.pct || 0;
+    const pct = a.total ? (a.pct || 0) : 0;
+    const unknow = !a.total;   // 部分播放地址不给 Content-Length, 只能显示已下多少
     const sp = a.speed ? (a.speed/1048576).toFixed(1)+" MB/s" : "";
     const left = a.total && a.speed ? Math.max(0, (a.total-a.done)/a.speed) : 0;
     return `<div class="dl">
@@ -466,9 +473,9 @@ function render(){
         <div class="t">${esc(a.title||a.id)} ${a.quality?`<span class="badge">${esc(a.quality)}</span>`:""}</div>
         <div class="meta">${esc(a.author||"")} · ${fmtSize(a.done)} / ${a.total?fmtSize(a.total):"?"}
           ${sp?" · "+sp:""}${left?" · 剩余 "+Math.ceil(left)+"s":""}</div>
-        <div class="bar-bg"><div class="bar-fg" style="width:${pct}%"></div></div>
+        <div class="bar-bg"><div class="bar-fg" style="width:${unknow?100:pct}%${unknow?";opacity:.3":""}"></div></div>
       </div>
-      <div style="font-size:20px;font-weight:700;color:${pct>=100?"var(--ok)":"var(--cyan)"}">${pct.toFixed(0)}%</div>
+      <div style="font-size:${unknow?"13px":"20px"};font-weight:700;color:${pct>=100?"var(--ok)":"var(--cool)"}">${unknow?fmtSize(a.done):pct.toFixed(0)+"%"}</div>
     </div>`;
   }).join("");
 
@@ -509,11 +516,16 @@ function render(){
   }
   const sort = $("sort").value;
   if(sort==="size") list.sort((a,b)=>(b.size||0)-(a.size||0));
-  if(sort==="quality") list.sort((a,b)=>String(b.quality).localeCompare(String(a.quality)));
+  if(sort==="quality") list.sort((a,b)=>pxOf(b.quality)-pxOf(a.quality));
 
   $("cnt").textContent = list.length ? `(${list.length})` : "";
+  // 只有内容真的变了才重建卡片墙 —— 否则每秒一次推送都会重绘 150+ 张卡,
+  // 鼠标悬停、双击、刚点开的重试都会被打断, 图片也会重新闪一下
+  const sig = list.map(x=>[x.id,x.size,x.time,x.quality,x.title,x.type,x.cover].join("|")).join(";");
+  if(sig !== lastGridSig){
+    lastGridSig = sig;
   $("grid").innerHTML = list.map(x=>`
-    <div class="card" id="card-${x.id}" ondblclick="openWhat('file','${x.id}')" oncontextmenu="showMenu(event,'${x.id}');return false">
+    <div class="card" id="card-${idq(x.id)}" ondblclick="openWhat('file','${idq(x.id)}')" oncontextmenu="showMenu(event,'${idq(x.id)}');return false">
       <div class="thumb">
         ${thumbHtml(x)}
         ${x.type==="images"?`<span class="tag">图文</span>`:""}
@@ -524,13 +536,14 @@ function render(){
         <div class="title">${esc(x.title || x.file || x.id)}</div>
         <div class="sub"><span>${esc(x.author||"—")} · ${ago(x.time)}</span><span>${fmtSize(x.size)}</span></div>
         <div class="acts">
-          <button onclick="openWhat('file','${x.id}')">打开</button>
-          <button onclick="openWhat('reveal','${x.id}')">定位</button>
-          <button onclick="copyLink('${x.id}')">链接</button>
-          <button class="danger" onclick="delRec('${x.id}')">删除</button>
+          <button onclick="openWhat('file','${idq(x.id)}')">打开</button>
+          <button onclick="openWhat('reveal','${idq(x.id)}')">定位</button>
+          <button onclick="copyLink('${idq(x.id)}')">链接</button>
+          <button class="danger" onclick="delRec('${idq(x.id)}')">删除</button>
         </div>
       </div>
     </div>`).join("");
+  }
   $("empty").style.display = list.length ? "none" : "";
 
   // 新完成 -> 提示
@@ -601,27 +614,45 @@ function drawChart(recent){
   }).join("");
 }
 
+// ---------- 网络 ----------
+// 面板所有写操作都走这里: 后台重启/网络断开时不会抛 unhandled rejection, 用户也能看到提示
+async function api(path, body){
+  try{
+    const r = await fetch(path, {method:"POST", headers:{"Content-Type":"application/json"},
+                                 body: JSON.stringify(body || {})});
+    return await r.json();
+  }catch(e){
+    toast("面板和后台断开了", "看下程序是不是被关了, 页面会自动重连");
+    return {ok:false};
+  }
+}
+
+// 画质排序用: "1080x1920" -> 2073600。按字符串比会把 720x1280 排到 1080x1920 前面
+function pxOf(q){
+  const m = String(q||"").match(/(\d{2,5})\s*[x×*]\s*(\d{2,5})/);
+  return m ? (+m[1]) * (+m[2]) : 0;
+}
+
+// 卡片和右键菜单的 id 会拼进 onclick 属性, 统一过白名单, 免得脏数据把属性截断
+function idq(v){ return String(v==null?"":v).replace(/[^0-9A-Za-z_-]/g, ""); }
+
 // 失败重试
 async function retryDl(aid){
-  const r = await fetch("/api/retry", {method:"POST", headers:{"Content-Type":"application/json"},
-                                       body: JSON.stringify({id: aid})});
-  const j = await r.json();
+  const j = await api("/api/retry", {id: aid});
   toast(j.ok ? "已重新排队" : "重试失败", j.ok ? "正在抓取最新视频地址…" : "稍后再试或看日志");
 }
 
 // 删除记录(文件+记录一起删)
 async function delRec(aid){
   if(!confirm("确定删除这个视频的文件和下载记录吗？")) return;
-  const r = await fetch("/api/delete", {method:"POST", headers:{"Content-Type":"application/json"},
-                                       body: JSON.stringify({id: aid})});
-  const j = await r.json();
+  const j = await api("/api/delete", {id: aid});
   toast(j.ok ? "已删除" : "删除失败", j.ok ? "文件和记录都清掉了" : "文件可能已经不在了");
 }
 
 // 设置: 按作者分文件夹
 async function setByAuthor(v){
-  await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"},
-                                body: JSON.stringify({by_author: !!v})});
+  const j = await api("/api/settings", {by_author: !!v});
+  if(!j.ok) return;
   [...$("byAuthorRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
   toast(v ? "已开启按作者分文件夹" : "已关闭按作者分文件夹",
         v ? "新下载会存到 downloads/作者名/" : "新下载全部放 downloads/");
@@ -629,8 +660,8 @@ async function setByAuthor(v){
 
 // 设置: 退出抖音后是否自动重新打开
 async function setAutoReopen(v){
-  await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"},
-                                body: JSON.stringify({auto_reopen: !!v})});
+  const j = await api("/api/settings", {auto_reopen: !!v});
+  if(!j.ok) return;
   [...$("autoReopenRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
   toast(v ? "已开启自动重开" : "已关闭自动重开",
         v ? "关掉抖音约 1 分钟后会自动重新打开" : "你关掉抖音后监听会自动结束, 下载也停了");
@@ -674,22 +705,22 @@ function setFilter(f){
 function toggleDrawer(on){
   $("drawer").classList.toggle("on", on);
   $("mask").classList.toggle("on", on);
+  if(on) pullLog();   // 打开就立刻拉一次, 不用等 3 秒轮询
 }
 function toggleLog(on){
   // 顶栏「查看日志」: 打开右侧日志抽屉
   toggleDrawer(!!on);
 }
 async function openWhat(what, id){
-  await fetch("/api/open", {method:"POST", headers:{"Content-Type":"application/json"},
-                            body: JSON.stringify({what, id})});
+  await api("/api/open", {what, id});
 }
 function copyLink(id){
   const u = "https://www.douyin.com/video/" + id;
   navigator.clipboard.writeText(u).then(()=>toast("已复制链接", u));
 }
 async function setQuality(k){
-  await fetch("/api/settings", {method:"POST", headers:{"Content-Type":"application/json"},
-                                body: JSON.stringify({quality:k})});
+  const j = await api("/api/settings", {quality:k});
+  if(!j.ok) return;
   [...$("qualityRadios").children].forEach(l=>l.classList.toggle("on", l.dataset.k===k));
   toast("已切换画质", STATE.quality_choices[k]);
 }
@@ -704,6 +735,9 @@ document.addEventListener("keydown", (e)=>{
     $("q").focus();
     $("q").select();
     return;
+  }
+  if((e.key === "t" || e.key === "T") && !typing && !e.ctrlKey && !e.metaKey && !e.altKey){
+    e.preventDefault(); goTop(); return;
   }
   if(e.key === "Escape"){
     if(document.getElementById("ctxmenu")){ closeMenu(); return; }
@@ -744,8 +778,9 @@ async function pullLog(){
     if(atBottom) box.scrollTop = box.scrollHeight;
   }catch(_){}
 }
-pullLog();
-setInterval(pullLog, 3000);
+setInterval(()=>{
+  if($("drawer").classList.contains("on")) pullLog();
+}, 3000);
 </script>
 </body>
 </html>
