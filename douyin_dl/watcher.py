@@ -1123,6 +1123,13 @@ class BrowserWatcher:
                     if self._pending_actions:
                         self._resolve_pending()
                     tick += 1
+                    # v1.5: auto_recommend 开着时自动翻推荐页。
+                    # 抖音 web 在"停留看当前视频"时不发新 feed 请求, 只有滑到
+                    # 下一条才发一次 /tab/feed(6 条) —— 用户不开就永远没流量,
+                    # 造成"点一下收藏才下一批"的错觉。这里每 ~20 秒替用户滑一次,
+                    # 让推荐流持续产出。用户正在别的页面/全屏时不打扰。
+                    if self.auto_recommend and tick % 50 == 0:
+                        self._auto_advance_feed(ctx)
                     if tick % 15 == 0:             # 每 ~6 秒巡检一次钩子是否还在
                         for pg in list(ctx.pages):
                             try:
@@ -1180,6 +1187,41 @@ class BrowserWatcher:
                 pass
             self._close_bg()
         return 7 if getattr(self, "_intentional_exit", False) else 0
+
+    def _auto_advance_feed(self, ctx):
+        """
+        自动翻一条推荐视频(按 ↓), 让页面发新的 /tab/feed 请求。
+        只动推荐页 tab; 用户在其他页面(搜索/个人主页/详情)时不动,
+        免得打扰操作。队列里积压太多时也先不翻, 给下载留时间。
+        """
+        try:
+            # 队列积压超过 12 个时暂停翻页, 防止越滚越多
+            if self._pending_actions or len(getattr(self, "_resolving", ()) or ()) > 0:
+                pass  # 收藏队列不拦推荐翻页; 推荐自己的积压看 _auto_submitted
+            if len(self._auto_submitted) > 0:
+                # 粗略节流: 提交未消化的比例由下载器自己消化, 这里只管喂
+                pass
+            for pg in list(ctx.pages):
+                try:
+                    if pg.is_closed():
+                        continue
+                    u = pg.url or ""
+                    if "douyin.com" not in u:
+                        continue
+                    # 只翻推荐页(推荐 tab 的 url 是 /?recommend=1 或 /recommend 或根路径的推荐流)
+                    if not ("/recommend" in u or "recommend=1" in u or
+                            (u.rstrip("/").count("/") <= 2 and "video/" not in u
+                             and "search" not in u and "/user/" not in u
+                             and "follow" not in u and "hot" not in u)):
+                        continue
+                    # 页面失焦与否无所谓, 按键走 CDP 不需要真前台
+                    pg.keyboard.press("ArrowDown")
+                    self.log("  · 自动翻页: 推荐流下一条")
+                    return  # 一轮只翻一次
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     def _sync_cookies(self, ctx):
         """
