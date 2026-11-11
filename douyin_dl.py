@@ -284,6 +284,23 @@ class Downloader(threading.Thread):
         return True
 
     def process(self, aweme: dict, source: str):
+        # 推荐页(feed/related)列表里的候选 URL 带 ply_type=4&tk=webid,
+        # 是页面播放器的内部令牌流, requests 直接下会 403。
+        # 必须先走无头浏览器抓一次视频详情页, 换成 detail 接口的可直下 URL。
+        # 抓不到(浏览器没开/详情页失败)才用列表自带的候选硬试。
+        if source == "推荐页":
+            aid0 = str(aweme.get("aweme_id") or "")
+            try:
+                detail = refetch_aweme(aid0, self.session)
+            except Exception as e:  # noqa: BLE001
+                detail = None
+                self.log(f"  · 推荐页预取详情失败({e}), 用列表自带地址硬试")
+            if detail:
+                aweme = detail
+                self.log("  · 已换成详情页地址(可直下)")
+            elif aid0:
+                self.log("  · 没抓到详情, 直接用列表地址试(可能 403)")
+
         info = parse_aweme(aweme)
         if not info.aweme_id:
             return
