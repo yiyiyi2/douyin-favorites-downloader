@@ -307,7 +307,7 @@ def _safe_id(v) -> str:
 
 
 def load_settings(path: Path) -> dict:
-    data = {"quality": "max", "open_browser": True, "auto_reopen": True, "by_author": False}
+    data = {"quality": "max", "open_browser": True, "auto_reopen": True, "by_author": False, "auto_rec": False}
     try:
         if path.exists():
             data.update(json.loads(path.read_text(encoding="utf-8")))
@@ -358,6 +358,7 @@ class EventBus:
         self.failed: dict[str, dict] = {}          # aid -> {title, author, cover, why, time}
         self.on_retry = None                        # callable(aid) | None, 由主程序注入
         self.on_delete = None                       # callable(aid) -> bool, 由主程序注入(带锁删记录)
+        self.on_auto_rec = None                     # callable(bool), 由主程序注入(实时切换 watcher.auto_recommend)
         self.status = {"running": False, "browser": "", "note": ""}
         self.started = time.time()
         self.max_speed = 0.0
@@ -583,6 +584,7 @@ class EventBus:
             "out_dir": str(self.out_dir),
             "by_author": bool(conf.get("by_author")),
             "auto_reopen": bool(conf.get("auto_reopen", True)),
+            "auto_rec": bool(conf.get("auto_rec", False)),
             "out_dir_configured": bool(conf.get("out_dir")),
         }
 
@@ -779,6 +781,15 @@ class _Handler(BaseHTTPRequestHandler):
                 cur["by_author"] = body["by_author"]
             if isinstance(body.get("auto_reopen"), bool):
                 cur["auto_reopen"] = body["auto_reopen"]
+            # v1.4: 自动下推荐页开关。保存时立即同步给 watcher, 不重启就生效。
+            if isinstance(body.get("auto_rec"), bool):
+                cur["auto_rec"] = body["auto_rec"]
+                cb = getattr(self.bus, "on_auto_rec", None)
+                if callable(cb):
+                    try:
+                        cb(body["auto_rec"])
+                    except Exception:
+                        pass
             # 下载目录可调: 必须是绝对路径; 相对路径按工作区补全后存。
             # 建不出来(盘不存在/没权限)就拒绝, 不留下一个下载会悄悄失败的设置。
             if "out_dir" in body:

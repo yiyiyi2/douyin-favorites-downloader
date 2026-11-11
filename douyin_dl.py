@@ -694,6 +694,13 @@ def main():
     else:
         watcher.download_all_on_start = False
 
+    # v1.4: 自动下推荐页(设置里开关, 默认关)。启动时读设置, 面板改设置时实时切换。
+    _conf0 = load_settings(SETTINGS_FILE)
+    watcher.auto_recommend = bool(_conf0.get("auto_rec", False))
+    if watcher.auto_recommend:
+        log("  模式: 自动下载推荐页视频已开启(设置里可随时关)")
+    bus.on_auto_rec = lambda v: setattr(watcher, "auto_recommend", bool(v))
+
     rc = 0
     try:
         rc = watcher.run()

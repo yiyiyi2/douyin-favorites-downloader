@@ -344,6 +344,13 @@
     </div>
   </div>
   <div class="field">
+    <label>自动下载推荐页视频 <span style="color:#8a94a6;font-weight:400;font-size:11px">（开着刷推荐页，加载到的视频自动进下载队列）</span></label>
+    <div class="radios" id="autoRecRadios">
+      <label class="radio" data-k="0"><input type="radio" name="auc" onchange="setAutoRec(0)"> 关（只下我收藏的）</label>
+      <label class="radio" data-k="1"><input type="radio" name="auc" onchange="setAutoRec(1)"> 开（推荐页看到的都下，量大注意磁盘）</label>
+    </div>
+  </div>
+  <div class="field">
     <label>下载目录 <span style="color:#8a94a6;font-weight:400;font-size:11px">（改成其他盘/文件夹后，新视频就存那里）</span></label>
     <div style="display:flex;gap:8px">
       <input id="outdirInput" style="flex:1;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px/1.4 Consolas,monospace" spellcheck="false">
@@ -608,6 +615,14 @@ function render(){
     const on = (STATE.auto_reopen !== false) ? 1 : 0;
     [...$("autoReopenRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === on));
   }
+  // 「自动下载推荐页视频」单选状态
+  {
+    const on = STATE.auto_rec ? 1 : 0;
+    [...$("autoRecRadios").children].forEach(l=>{
+      l.classList.toggle("on", +l.dataset.k === on);
+      l.querySelector("input").checked = (+l.dataset.k === on);
+    });
+  }
 }
 
 // 近 14 天下载量柱状图(纯 CSS)
@@ -684,6 +699,15 @@ async function setAutoReopen(v){
   [...$("autoReopenRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
   toast(v ? "已开启自动重开" : "已关闭自动重开",
         v ? "关掉抖音约 1 分钟后会自动重新打开" : "你关掉抖音后监听会自动结束, 下载也停了");
+}
+
+// 设置: 自动下载推荐页视频
+async function setAutoRec(v){
+  const j = await api("/api/settings", {auto_rec: !!v});
+  if(!j.ok) return;
+  [...$("autoRecRadios").children].forEach(l=>l.classList.toggle("on", +l.dataset.k === v));
+  toast(v ? "已开启自动下推荐" : "已关闭自动下推荐",
+        v ? "刷推荐页时加载到的视频会自动进下载队列" : "回到只下收藏的模式");
 }
 
 // 右键菜单

@@ -423,6 +423,10 @@ class BrowserWatcher:
         self.known_favs: set[str] = set()
 
         self.download_all_on_start = False
+        # v1.4: 自动下推荐页(默认关)。开启后 feed/related 流量里出现的视频
+        # 全部进下载队列(去重), 不只当前刷到的那一条。
+        self.auto_recommend = False
+        self._auto_submitted: set[str] = set()   # 本会话已提交过的推荐视频, 防重复
         self._lock = threading.Lock()
         self._pending_actions: list[str] = []
         self._page = None
@@ -579,6 +583,36 @@ class BrowserWatcher:
                 # 收藏列表只用来建基线/缓存候选数据, 绝不作为下载触发。
                 # 原因: 第一页内容会自己轮换, 靠列表比对会把旧收藏当成新收藏重下。
                 # 真正的触发只认 action 分支里「用户亲手点收藏」那条路。
+
+            # v1.4: 自动下推荐页 —— feed(推荐信息流)/related(相关推荐)流量里
+            # 加载到的视频全部进下载队列。去重靠三道防线:
+            #   1) _auto_submitted 本会话不重复提交;
+            #   2) known_favs 里已有的收藏不重复交(收藏那条路会自己下);
+            #   3) Downloader.submit 里的 state 已下载检查兜底。
+            elif self.auto_recommend and (
+                "/tab/feed" in url or "/aweme/related" in url
+            ):
+                todo = []
+                with self._lock:
+                    for a in awemes:
+                        aid = str(a.get("aweme_id") or "")
+                        if not aid or aid in self._auto_submitted or aid in self.known_favs:
+                            continue
+                        self._auto_submitted.add(aid)
+                        todo.append(aid)
+                if todo:
+                    self.log(f"  推荐页: 新增 {len(todo)} 个视频进队列 "
+                             f"(累计提交 {len(self._auto_submitted)})")
+                    for aid in todo:
+                        aw = self._get_cached(aid)
+                        if aw:
+                            try:
+                                self.on_aweme(aw, "推荐页")
+                            except Exception as e:
+                                self.log(f"  ! 推荐页提交失败 {aid}: {e}")
+                                # 提交失败时撤回标记, 下次流量再见到还能再试
+                                with self._lock:
+                                    self._auto_submitted.discard(aid)
 
         elif kind == "action":
             # 记下原始请求, 排查「我明明点了收藏, 日志却说取消」时要靠它
