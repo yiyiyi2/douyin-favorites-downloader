@@ -369,3 +369,119 @@ def test_launch_headless_uses_system_chrome_first(monkeypatch):
     got = BrowserWatcher._launch_headless(pw)
     assert got == "browser-0"                   # 第一路就成了
     assert pw.chromium.calls[0]["executable_path"].endswith("chrome.exe")
+
+
+# --- v1.6.2 面板交互: 收藏秒显示 / 队列 / 失败项重试与忽略 -----------------
+
+def test_on_pending_fires_when_favorite_detected():
+    """点了收藏要立刻通知面板, 不能等无头浏览器把详情抓回来(5~12 秒)。
+
+    这是「点完收藏盯着面板半天不动」的根因: 旧版只有详情回来后才 publish。
+    """
+    seen: list[str] = []
+    w = BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()),
+                       on_pending=lambda aid: seen.append(aid),
+                       log=lambda m: None)
+    url = ("https://www.douyin.com/aweme/v1/web/aweme/collect/"
+           "?action=1&aweme_id=7705427599274719717")
+    w._on_payload("action", url, "", '{"aweme_id":"7705427599274719717"}')
+    assert seen == ["7705427599274719717"]
+
+    # 同一条重复上报(钩子重发/页面重试)不该把面板刷成两条
+    w._on_payload("action", url, "", '{"aweme_id":"7705427599274719717"}')
+    assert seen == ["7705427599274719717"]
+
+
+def test_on_pending_not_fired_for_uncollect():
+    """取消收藏不能冒出「解析中」的假进度。"""
+    seen: list[str] = []
+    w = BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()),
+                       on_pending=lambda aid: seen.append(aid),
+                       log=lambda m: None)
+    url = ("https://www.douyin.com/aweme/v1/web/aweme/collect/"
+           "?action=0&aweme_id=7705427599274719717")
+    w._on_payload("action", url, "", '{"aweme_id":"7705427599274719717"}')
+    assert seen == []
+
+
+def test_add_waiting_upgrades_resolving_placeholder():
+    """先插「解析中」占位, 详情回来后再补标题/来源, 队列里只留一条。"""
+    ws = Path(tempfile.mkdtemp())
+    bus = EventBus(ws, ws / "downloads", ws / ".state.json", ws / "log")
+    bus.add_waiting("7705427599274719717", source="解析中")
+    assert len(bus.waiting) == 1 and bus.waiting[0]["source"] == "解析中"
+
+    bus.add_waiting("7705427599274719717", title="耳机没了", author="小明", source="收藏")
+    assert len(bus.waiting) == 1                     # 没有变成两条
+    row = bus.waiting[0]
+    assert row["title"] == "耳机没了" and row["author"] == "小明"
+    assert row["source"] == "收藏"                   # 占位的「解析中」被替换
+    # 再补一次空信息不该把已有标题清掉
+    bus.add_waiting("7705427599274719717")
+    assert bus.waiting[0]["title"] == "耳机没了"
+
+
+def test_retry_marks_item_retrying_immediately():
+    """点重试要在一百毫秒内看到变化, 否则用户以为按钮坏了会连点。"""
+    ws = Path(tempfile.mkdtemp())
+    bus = EventBus(ws, ws / "downloads", ws / ".state.json", ws / "log")
+    aid = "7100000000000000009"
+    bus.failed[aid] = {"id": aid, "why": "403", "time": 1}
+
+    release = {"go": False}
+
+    def slow(a):
+        while not release["go"]:
+            time.sleep(0.01)
+        return True, ""
+
+    bus.on_retry = slow
+    assert bus.retry(aid) is True
+    assert bus.failed[aid].get("retrying") is True   # 立刻可见的反馈
+
+    # 已经在重试时再点一次, 不叠加第二个后台任务
+    assert bus.retry(aid) is True
+    release["go"] = True
+    for _ in range(60):
+        if aid not in bus.failed:
+            break
+        time.sleep(0.02)
+    assert aid not in bus.failed
+
+
+def test_retry_failure_uses_specific_reason():
+    """抓不到详情时把具体原因写回失败项, 而不是同一句「重试仍失败」。"""
+    ws = Path(tempfile.mkdtemp())
+    bus = EventBus(ws, ws / "downloads", ws / ".state.json", ws / "log")
+    aid = "7100000000000000010"
+    bus.failed[aid] = {"id": aid, "why": "403", "time": 1}
+    bus.on_retry = lambda a: (False, "拿不到视频详情(可能已删除/私密)")
+    assert bus.retry(aid) is True
+    for _ in range(60):
+        if "拿不到视频详情" in str(bus.failed.get(aid, {}).get("why", "")):
+            break
+        time.sleep(0.02)
+    why = bus.failed[aid]["why"]
+    assert "拿不到视频详情" in why and "403" in why     # 原因叠加, 原信息不丢
+    assert bus.failed[aid].get("retrying") is False     # 可再次重试
+
+
+def test_dismiss_removes_failed_item_only():
+    """叉掉失败项只改面板列表, 不碰已下载文件、不删下载记录。"""
+    ws = Path(tempfile.mkdtemp())
+    out = ws / "downloads"
+    out.mkdir()
+    video = out / "a.mp4"
+    video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"0" * 64)
+    state = ws / ".state.json"
+    state.write_text(json.dumps({"7100000000000000011": {"file": "downloads/a.mp4"}}),
+                     encoding="utf-8")
+
+    bus = EventBus(ws, out, state, ws / "log")
+    bus.failed["7100000000000000011"] = {"id": "7100000000000000011", "why": "403", "time": 1}
+
+    assert bus.dismiss("7100000000000000011") is True
+    assert "7100000000000000011" not in bus.failed
+    assert video.exists()                                   # 文件还在
+    assert "7100000000000000011" in json.loads(state.read_text(encoding="utf-8"))
+    assert bus.dismiss("7100000000000000011") is False      # 幂等, 不抛异常

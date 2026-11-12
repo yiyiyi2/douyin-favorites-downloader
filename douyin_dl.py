@@ -409,20 +409,24 @@ class Downloader(threading.Thread):
         except Exception:
             return False
 
-    def retry(self, aid: str) -> bool:
-        """面板点重试: 用无头浏览器重新抓一次详情, 抓到就重新入队。"""
+    def retry(self, aid: str) -> tuple[bool, str]:
+        """面板点重试: 用无头浏览器重新抓一次详情, 抓到就重新入队。
+
+        v1.6.2: 返回值从 bool 改成 (ok, 原因)。面板要能告诉用户"这次为什么还是
+        不行"(拿不到详情 / 视频可能已删除), 否则点完只看到失败项还在, 像是没反应。
+        """
         try:
             aw = refetch_aweme(aid, self.session)
         except Exception as e:
             self.log(f"  ! 重试 {aid} 抓取失败: {e}")
-            return False
+            return False, f"抓取异常: {str(e)[:60]}"
         if not aw:
             self.log(f"  ! 重试 {aid}: 拿不到视频信息")
-            return False
+            return False, "拿不到视频详情(可能已删除/私密/需要重新登录)"
         # v1.6: 走 submit() 而不是直接 q.put(), 让面板收到 add_waiting,
         # 用户能在队列里看到这条正在重试, 而不是"点了没动静"。
         self.submit(aw, "重试")
-        return True
+        return True, ""
 
     def process(self, aweme: dict, source: str):
         # 推荐页(feed/related)列表里的候选 URL 带 ply_type=4&tk=webid,
@@ -938,6 +942,8 @@ def main():
         log=log,
         headless=args.headless,
         on_status=lambda kw: bus.set_status(**kw),
+        # 识别到收藏动作就立刻让面板出现"解析中", 不等详情抓回来
+        on_pending=lambda aid: bus.add_waiting(aid, source="解析中"),
     )
     watcher.on_fail = lambda aid, why: bus.fail(aid, why)   # 抓不到详情也能在面板失败列表里看到
 

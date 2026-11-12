@@ -559,6 +559,7 @@ class BrowserWatcher:
         log=print,
         headless: bool = False,
         on_status: Callable[[dict], None] | None = None,
+        on_pending: Callable[[str], None] | None = None,
     ):
         self.profile_dir = Path(profile_dir)
         self.port = port
@@ -566,6 +567,11 @@ class BrowserWatcher:
         self.on_status = on_status or (lambda kw: None)
         # (aweme_id, 原因) -> 报给面板失败列表; 主程序会注入
         self.on_fail: Callable[[str, str], None] | None = None
+        # aweme_id -> 面板立刻显示"这条在解析中"。
+        # v1.6.2: 以前要等无头浏览器把详情抓回来(5~12 秒)才第一次 publish,
+        # 用户点完收藏盯着面板半天不动, 以为没生效。现在识别到收藏动作的
+        # 那一刻就先占个位, 详情回来后由 add_waiting/begin 自动接管。
+        self.on_pending = on_pending or (lambda aid: None)
         self.on_cookie = on_cookie or (lambda c: None)
         self.log = log
         self.headless = headless
@@ -839,6 +845,13 @@ class BrowserWatcher:
                 with self._lock:
                     if aid not in self._pending_actions:
                         self._pending_actions.append(aid)
+                    else:
+                        continue          # 已经在补全队列里, 别重复告知面板
+                # 先让面板上出现"解析中", 不用等详情抓回来
+                try:
+                    self.on_pending(aid)
+                except Exception:
+                    pass
                 self.log(f"  · 新收藏 {aid}, 正在抓取最新视频信息…")
 
     # -- 补全: 用无头浏览器取详情 -------------------------------------------

@@ -543,14 +543,32 @@ class EventBus:
         self.publish()
 
     def add_waiting(self, aid: str, title: str = "", author: str = "", source: str = ""):
+        changed = False
         with self.lock:
-            if any(x["id"] == aid for x in self.waiting):
-                return
-            self.waiting.append({"id": aid, "title": title, "author": author,
-                                 "source": source, "at": int(time.time())})
-            if len(self.waiting) > 500:          # 长期挂机别让队列无限涨
-                del self.waiting[:-500]
-        self.publish()
+            for x in self.waiting:
+                if x.get("id") != aid:
+                    continue
+                # v1.6.2: 收藏那一刻先插一条占位(source="解析中"), 详情抓回来
+                # 后再调一次 add_waiting。旧版直接 return, 占位的空标题/「解析中」
+                # 就永远留在队列里了 —— 现在用后来的信息把它补全。
+                if title and not x.get("title"):
+                    x["title"] = title
+                    changed = True
+                if author and not x.get("author"):
+                    x["author"] = author
+                    changed = True
+                if source and source != "解析中" and x.get("source") != source:
+                    x["source"] = source
+                    changed = True
+                break
+            else:
+                self.waiting.append({"id": aid, "title": title, "author": author,
+                                     "source": source, "at": int(time.time())})
+                if len(self.waiting) > 500:          # 长期挂机别让队列无限涨
+                    del self.waiting[:-500]
+                changed = True
+        if changed:
+            self.publish()
 
     def pop_waiting(self, aid: str | None = None):
         with self.lock:
@@ -630,34 +648,69 @@ class EventBus:
     def retry(self, aid: str) -> bool:
         """把失败的那条重新交给下载器。
 
-        v1.6: 改成后台线程受理。旧版同步等 on_retry(内部 refetch 最多 30 秒),
-        POST /api/retry 会把整个面板冻住, 用户以为没反应又连点好几下, 结果
-        重抓好几次、入队好几条。现在立即返回 True(已受理), 抓取结果由后台
-        线程回来后更新失败列表: 成功 -> 摘掉失败项(下载器内部已发 add_waiting
-        让它出现在队列里); 失败 -> 更新原因, 失败项还在, 可以再试。
+        v1.6: 改成后台线程受理, POST /api/retry 不再等 refetch(最多 30 秒),
+        整个面板不会被冻住。
+        v1.6.2: 受理后**立刻**把这行标成 retrying 并推送。旧版虽然也是异步,
+        但失败项要等无头浏览器抓完(5~45 秒)才第一次变化, 用户盯着看就是
+        「点了没反应」, 于是连点好几下。现在点下去一百毫秒内就有反馈;
+        抓取失败时把具体原因写回 why, 用户知道为什么还是不行。
         """
         fn = self.on_retry
         if not fn:
             return False
         aid = str(aid)
+        with self.lock:
+            rec = self.failed.get(aid)
+            if not isinstance(rec, dict):
+                return False
+            if rec.get("retrying"):
+                return True                  # 已经在抓了, 别叠加请求
+            rec["retrying"] = True
+            rec["time"] = int(time.time())
+        self.publish()
 
         def _work():
+            ok = False
+            why = ""
             try:
-                ok = bool(fn(aid))
-            except Exception:
-                ok = False
-            with self.lock:
-                if ok:
-                    self.failed.pop(aid, None)
+                res = fn(aid)
+                if isinstance(res, tuple):
+                    ok = bool(res[0])
+                    why = str(res[1] or "") if len(res) > 1 else ""
                 else:
-                    rec = self.failed.get(aid)
-                    if isinstance(rec, dict):
-                        rec["why"] = (str(rec.get("why") or "") + " · 重试仍失败").strip(" ·")
-                        rec["time"] = int(time.time())
+                    ok = bool(res)
+            except Exception as e:
+                why = f"重试异常: {str(e)[:60]}"
+            with self.lock:
+                rec2 = self.failed.get(aid)
+                if isinstance(rec2, dict):
+                    if ok:
+                        self.failed.pop(aid, None)
+                    else:
+                        rec2["retrying"] = False
+                        base = str(rec2.get("why") or "")
+                        add = why or "重试仍失败"
+                        # 别把同一句原因叠成 "xxx · xxx · xxx"
+                        if add not in base:
+                            base = (base + " · " + add).strip(" ·")
+                        rec2["why"] = base
+                        rec2["time"] = int(time.time())
             self.publish()
 
         threading.Thread(target=_work, name=f"dy-ui-retry-{aid[:12]}", daemon=True).start()
         return True
+
+    def dismiss(self, aid: str) -> bool:
+        """从面板上叉掉一条失败记录。
+
+        只动内存里的失败清单, 不碰已下载的文件、不动 .state.json —— 用户
+        要的是「别在我眼前挂着」, 不是把下载好的东西删了。
+        """
+        with self.lock:
+            gone = self.failed.pop(str(aid), None) is not None
+        if gone:
+            self.publish()
+        return gone
 
     def set_speed(self, mbps: float):
         with self.lock:
@@ -1072,6 +1125,11 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/retry":
             ok = self.bus.retry(_safe_id(body.get("id")))
             self._json({"ok": ok})
+            return
+
+        if path == "/api/fail/dismiss":
+            # 只把这条从失败清单里叉掉, 不动文件、不动下载记录
+            self._json({"ok": self.bus.dismiss(_safe_id(body.get("id")))})
             return
 
         if path == "/api/delete":

@@ -104,17 +104,41 @@
   .badge{font-size:10.5px;padding:2px 8px;border-radius:999px;background:rgba(79,195,217,.10);
          color:var(--cool);border:1px solid rgba(79,195,217,.22);font-weight:500}
 
-  /* 队列 */
-  .queue{display:flex;flex-wrap:wrap;gap:8px}
-  .qitem{background:var(--panel);border:1px dashed var(--line-2);border-radius:10px;padding:6px 11px;
-         font-size:12px;color:var(--muted);max-width:280px;overflow:hidden;
-         text-overflow:ellipsis;white-space:nowrap}
+  /* 队列: 一行一条, 序号 + 标题 + 状态, 超过一屏就滚动 */
+  .queue{background:var(--panel);border:1px solid var(--line);border-radius:13px;overflow:hidden}
+  .q-head{display:flex;justify-content:space-between;align-items:center;
+          padding:9px 14px;font-size:11.5px;color:var(--muted);
+          border-bottom:1px solid var(--line);background:rgba(255,255,255,.012)}
+  .q-list{list-style:none;margin:0;padding:0;max-height:196px;overflow-y:auto}
+  .q-list::-webkit-scrollbar{width:6px}
+  .q-list::-webkit-scrollbar-thumb{background:#2a3444;border-radius:99px}
+  .q-row{display:flex;align-items:center;gap:10px;padding:8px 14px;
+         font-size:12.5px;border-bottom:1px solid rgba(255,255,255,.035)}
+  .q-row:last-child{border-bottom:0}
+  .q-idx{flex:0 0 18px;text-align:right;color:#46536a;font-size:11px;
+         font-variant-numeric:tabular-nums}
+  .q-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+           white-space:nowrap;color:#c3ccd9}
+  .q-tag{flex:0 0 auto;font-size:10.5px;padding:2px 8px;border-radius:999px;
+         border:1px solid var(--line-2);color:var(--muted)}
+  .q-tag.resolving{color:var(--cool);border-color:rgba(79,195,217,.32);
+                   background:rgba(79,195,217,.09)}
+  .q-more{padding:8px 14px;font-size:11.5px;color:var(--muted);
+          border-top:1px solid var(--line)}
 
   /* 失败列表 */
   .failed-list{display:flex;flex-direction:column;gap:8px}
   .fitem{background:rgba(58,26,34,.35);border:1px solid rgba(239,91,107,.22);border-radius:12px;
-         padding:11px 14px;display:flex;gap:12px;align-items:center}
+         padding:11px 14px;display:flex;gap:12px;align-items:center;transition:opacity .2s}
+  .fitem.busy{opacity:.72}
+  .f-main{min-width:0;flex:1}
+  .fitem .t{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .fitem .meta{color:#cf8493;font-size:11.5px;margin-top:2px}
+  .f-x{flex:0 0 auto;width:26px;height:26px;line-height:1;border-radius:8px;
+       background:transparent;border:1px solid var(--line-2);color:#7b8798;
+       font-size:15px;cursor:pointer;padding:0}
+  .f-x:hover{color:#ff8b9d;border-color:rgba(239,91,107,.42);background:rgba(239,91,107,.10)}
+  button.busy{opacity:.6;cursor:default}
   .btn{padding:5px 12px;border-radius:9px;font-size:12px}
   button.danger{color:#ff8b9d;border-color:rgba(239,91,107,.22)}
   button.danger:hover{background:rgba(239,91,107,.10);border-color:rgba(239,91,107,.4)}
@@ -527,23 +551,46 @@ function render(){
     </div>`;
   }).join("");
 
-  // 队列
+  // 队列: 一行一条, 带序号和状态; 一次最多铺 12 行, 多的折叠成一句提示
   const wait = STATE.waiting || [];
   $("queueWrap").style.display = wait.length ? "" : "none";
-  $("queue").innerHTML = wait.map(w=>
-    `<div class="qitem" title="${esc(w.title)}">⏳ ${esc(w.title||w.id)}</div>`).join("");
+  if(wait.length){
+    const shown = wait.slice(0, 12);
+    const rest = wait.length - shown.length;
+    $("queue").innerHTML =
+      `<div class="q-head"><span>共 ${wait.length} 条</span><span>按收藏顺序依次下载</span></div>`
+      + `<ol class="q-list">`
+      + shown.map((w,i)=>{
+          const resolving = (w.source === "解析中");
+          const tail = String(w.id || "").slice(-6);
+          const label = w.title || (w.author ? `${w.author} 的视频` : `视频 …${tail}`);
+          return `<li class="q-row">
+            <span class="q-idx">${i+1}</span>
+            <span class="q-title" title="${esc(w.title || label)}">${esc(label)}</span>
+            <span class="q-tag ${resolving ? "resolving" : ""}">${resolving ? "解析中" : "排队"}</span>
+          </li>`;
+        }).join("")
+      + `</ol>`
+      + (rest > 0 ? `<div class="q-more">还有 ${rest} 条在排队…</div>` : "");
+  }
 
   // 失败列表
   const fails = STATE.failed || [];
   $("failedWrap").style.display = fails.length ? "" : "none";
-  $("failed").innerHTML = fails.map(f=>
-    `<div class="fitem">
-       <div style="min-width:0;flex:1">
-         <div class="t" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.title||f.id)}</div>
-         <div class="meta">${esc(f.why||"未知原因")} · ${fmtTime(f.time)}</div>
+  $("failed").innerHTML = fails.map(f=>{
+    const busy = !!f.retrying;
+    const label = f.title || `视频 …${String(f.id || "").slice(-6)}`;
+    return `<div class="fitem${busy ? " busy" : ""}">
+       <div class="f-main">
+         <div class="t" title="${esc(label)}">${esc(label)}</div>
+         <div class="meta">${esc(f.why || "未知原因")} · ${fmtTime(f.time)}</div>
        </div>
-       <button class="btn" onclick="retryDl('${idq(f.id)}')">重试</button>
-     </div>`).join("");
+       <button class="btn${busy ? " busy" : ""}" ${busy ? "disabled" : ""}
+               onclick="retryDl('${idq(f.id)}')">${busy ? "重试中…" : "重试"}</button>
+       <button class="f-x" title="忽略这条（不删文件）"
+               onclick="dismissFail('${idq(f.id)}')">×</button>
+     </div>`;
+  }).join("");
 
   // 近 14 天柱状图
   drawChart(STATE.recent || []);
@@ -718,8 +765,18 @@ function idq(v){ return String(v==null?"":v).replace(/[^0-9A-Za-z_-]/g, ""); }
 
 // 失败重试
 async function retryDl(aid){
+  const f = (STATE.failed||[]).find(x=>String(x.id)===String(aid));
+  if(f && f.retrying){ toast("正在重试中", "这条还在抓地址，等它出结果"); return; }
   const j = await api("/api/retry", {id: aid});
-  toast(j.ok ? "已重新排队" : "重试失败", j.ok ? "正在抓取最新视频地址…" : "稍后再试或看日志");
+  if(j.ok) toast("已重新抓取", "拿到最新地址后会自动排队下载");
+  else toast("重试失败", "这条可能已删除/私密，或者面板与后台断开");
+}
+
+// 叉掉一条失败记录(只从列表里移掉, 不动已下载的文件)
+async function dismissFail(aid){
+  const j = await api("/api/fail/dismiss", {id: aid});
+  toast(j.ok ? "已忽略" : "这条已经不在了",
+        j.ok ? "只是从失败列表里移掉，文件没动" : "可能刚刚重试成功，已经被摘掉");
 }
 
 // 删除记录(文件+记录一起删)
