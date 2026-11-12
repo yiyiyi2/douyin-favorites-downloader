@@ -485,3 +485,50 @@ def test_dismiss_removes_failed_item_only():
     assert video.exists()                                   # 文件还在
     assert "7100000000000000011" in json.loads(state.read_text(encoding="utf-8"))
     assert bus.dismiss("7100000000000000011") is False      # 幂等, 不抛异常
+
+
+# --- v1.6.3 启动后第一个收藏必失败的竞态 -------------------------------
+
+def test_ensure_hl_worker_keeps_pending_requests(monkeypatch):
+    """起线程时只清退出信号, 已在队列里的真请求必须留着。
+
+    回归: v1.6 把"排空残留"放在线程里做, 而 _resolve_pending 是
+    「先起线程 → 再取 cookie → 再投递」, 线程跑到排空时新请求已经入队,
+    被当成残留丢掉并回 None, 主循环 2 秒内就判定"拿不到视频信息"。
+    表现: 每次启动后第一个收藏必失败, 之后的都正常。
+    """
+    import queue as _q
+
+    monkeypatch.setattr(BrowserWatcher, "_hl_loop", lambda self: None)
+    w = BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()), log=lambda m: None)
+    w._hl_thread = None
+    w._hl_in = _q.Queue()
+    w._hl_out = _q.Queue()
+    w._hl_in.put(None)                                # 上次留下的退出信号
+    w._hl_in.put(("7705427599274719717", [{"name": "sessionid"}]))   # 已投递的真请求
+
+    w._ensure_hl_worker()
+
+    left = []
+    while True:
+        try:
+            left.append(w._hl_in.get_nowait())
+        except _q.Empty:
+            break
+    assert left == [("7705427599274719717", [{"name": "sessionid"}])]
+
+
+def test_requeue_clears_stale_failed_entry():
+    """重新入队(重新收藏/重试成功)要立刻摘掉失败列表里的旧记录。
+
+    否则重新收藏下载成功之后, 面板"下载失败"里还挂着同一条, 看着像没修好。
+    """
+    ws = Path(tempfile.mkdtemp())
+    bus = EventBus(ws, ws / "downloads", ws / ".state.json", ws / "log")
+    aid = "7706764113468247336"
+    bus.fail(aid, "抓不到视频详情")
+    assert aid in bus.failed
+
+    bus.add_waiting(aid, source="解析中")
+    assert aid not in bus.failed          # 旧失败记录被摘掉
+    assert any(x["id"] == aid for x in bus.waiting)

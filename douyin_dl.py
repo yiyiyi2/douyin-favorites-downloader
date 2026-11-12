@@ -945,7 +945,16 @@ def main():
         # 识别到收藏动作就立刻让面板出现"解析中", 不等详情抓回来
         on_pending=lambda aid: bus.add_waiting(aid, source="解析中"),
     )
-    watcher.on_fail = lambda aid, why: bus.fail(aid, why)   # 抓不到详情也能在面板失败列表里看到
+    def _on_fail(aid, why):
+        # v1.6.3: 失败时还得把队列里那条「解析中」占位摘掉。v1.6.2 只记了失败
+        # 列表, 占位就永远挂在队列上写着"解析中", 用户看到一条卡死的假进度。
+        try:
+            bus.pop_waiting(aid)
+        except Exception:
+            pass
+        bus.fail(aid, why)
+
+    watcher.on_fail = _on_fail   # 抓不到详情也能在面板失败列表里看到
 
     if args.download_all:
         log("  模式: 先补下现有收藏, 再进入监听")

@@ -545,6 +545,11 @@ class EventBus:
     def add_waiting(self, aid: str, title: str = "", author: str = "", source: str = ""):
         changed = False
         with self.lock:
+            # v1.6.3: 这条又进队列了(重新收藏 / 重试成功 / 解析中), 说明它正在
+            # 重新走流程, 失败列表里那条旧记录必须立刻摘掉。否则用户重新收藏
+            # 成功后, 面板上"下载失败"还挂着同一条 —— 看着像根本没修好。
+            if self.failed.pop(str(aid), None) is not None:
+                changed = True
             for x in self.waiting:
                 if x.get("id") != aid:
                     continue

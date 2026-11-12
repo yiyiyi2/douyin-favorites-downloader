@@ -920,20 +920,15 @@ class BrowserWatcher:
                     locale="zh-CN",
                 )
                 page = ctx.new_page()
-                # v1.6: 复用队列后, 上次线程可能留下一条 None(退出信号)或几个
-                # 没处理完的请求。None 直接丢; 元组回一个 None 让主循环走重排,
-                # 不能在用新 page 处理旧请求时又把旧 None 当成退出信号自己退掉。
-                while True:
-                    try:
-                        stale = self._hl_in.get_nowait()
-                    except queue.Empty:
-                        break
-                    if stale is None:
-                        continue
-                    try:
-                        self._hl_out.put((stale[0], None))
-                    except Exception:
-                        pass
+                # v1.6.3: 这里曾经有一段「排空残留队列」的逻辑, 是个严重的竞态:
+                # _resolve_pending 先 _ensure_hl_worker() 起线程, 然后才去取
+                # cookies、把 (aid, cookies) 投进 _hl_in; 而线程要等
+                # sync_playwright 启动 + _launch_headless 之后才跑到排空这段,
+                # 那时新请求已经躺在队列里了 —— 被当成"残留"丢掉并回 None,
+                # 主循环随即判定"拿不到视频信息"。表现就是: 每次启动后的第一个
+                # 收藏必然失败、后面的都正常, 用户以为下载功能坏了。
+                # 真正的需求只是别把上一次的退出信号(None)当成这次的退出信号,
+                # 那件事放 _ensure_hl_worker 里做, 且只丢 None、真请求一律保留。
                 while True:
                     item = self._hl_in.get()
                     if item is None:            # 退出信号
@@ -1033,6 +1028,22 @@ class BrowserWatcher:
             self._hl_in = queue.Queue()
         if self._hl_out is None:
             self._hl_out = queue.Queue()
+        # v1.6.3: 在**主循环投递新请求之前**清掉上次留下的退出信号。
+        # 只丢 None, 真正的 (aid, cookies) 一个都不动 —— 上一版在线程里排空,
+        # 而那时新请求已经入队, 于是每次启动后第一个收藏都被当成残留吃掉。
+        try:
+            kept: list = []
+            while True:
+                try:
+                    it = self._hl_in.get_nowait()
+                except queue.Empty:
+                    break
+                if it is not None:
+                    kept.append(it)
+            for it in kept:
+                self._hl_in.put(it)
+        except Exception:
+            pass
         self._hl_thread = threading.Thread(target=self._hl_loop,
                                            name="dy-headless", daemon=True)
         self._hl_thread.start()
