@@ -27,19 +27,46 @@ LOG_FILE = WORKSPACE / "douyin_dl.log"
 SETTINGS_FILE = WORKSPACE / ".settings.json"
 WEB_FILE = WORKSPACE / "douyin_dl" / "web" / "index.html"
 
-from douyin_dl.ui import (
-    EventBus,
-    filter_candidates,
-    load_settings,
-    save_settings,
-    start_ui,
-)
-import douyin_dl.ui as ui_mod
+def _dep_error(exc: Exception):
+    """依赖缺失/损坏时给一句人话并写进日志, 别只甩一个 traceback。
+
+    v1.6: 以前顶层 import 直接失败, pythonw 守护模式下连一行日志都没有,
+    用户只看到"程序一直重启", 完全不知道要 pip install。"""
+    import traceback
+    msg = (f"[{time.strftime('%H:%M:%S')}] 依赖加载失败: {exc}\n"
+           f"  请在本目录执行: pip install -r requirements.txt\n"
+           f"{traceback.format_exc()}")
+    try:
+        print(msg)
+    except Exception:
+        pass
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+try:
+    from douyin_dl.ui import (
+        EventBus,
+        filter_candidates,
+        load_settings,
+        save_settings,
+        start_ui,
+    )
+    import douyin_dl.ui as ui_mod
+except Exception as _e:      # noqa: BLE001
+    _dep_error(_e)
+    raise
 
 # 下载目录的运行时取值: 设置文件 out_dir > 启动参数 > 工作区/downloads。
 # OUT_DIR 在 main() 里按上面顺序初始化一次; 下载线程里每次都经 get_out_dir() 取,
 # 这样面板里改了目录, 不重启主进程也能对下一个视频生效。
 OUT_DIR = WORKSPACE / "downloads"
+# v1.6: 用户的 Chrome 调试端口由 --port 决定, 别再到处写死 9222。
+# 写死会导致自定义端口时 cookie 同步读错端口 -> 详情地址 403。
+_CDP_PORT = 9222
 
 
 def get_out_dir() -> Path:
@@ -65,16 +92,20 @@ def save_settings_file(path, data):
 
 _log_lock = threading.Lock()
 
-from douyin_dl.core import (
-    build_filename,
-    build_session,
-    download,
-    parse_aweme,
-    probe_size,
-    safe_name,
-    verify_video,
-    VideoInfo,
-)
+try:
+    from douyin_dl.core import (
+        build_filename,
+        build_session,
+        download,
+        parse_aweme,
+        probe_size,
+        safe_name,
+        verify_video,
+        VideoInfo,
+    )
+except Exception as _e:      # noqa: BLE001
+    _dep_error(_e)
+    raise
 
 
 def refetch_aweme(aid: str, session) -> dict | None:
@@ -107,15 +138,19 @@ def _hd_cookies_from_browser() -> list:
         return cached
     import urllib.request
     try:
-        with urllib.request.urlopen("http://127.0.0.1:9222/json/version", timeout=3):
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{_CDP_PORT}/json/version", timeout=3):
             pass
     except Exception:
         return cached or []
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as pw:
-            br = pw.chromium.connect_over_cdp("http://127.0.0.1:9222")
-            ctx = br.contexts[0]
+            br = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{_CDP_PORT}")
+            ctx = br.contexts[0] if br.contexts else None
+            if ctx is None:
+                br.close()
+                return cached or []
             cooked = [{"name": c["name"], "value": c["value"], "domain": c["domain"],
                        "path": c.get("path", "/")} for c in ctx.cookies()
                       if "douyin" in (c.get("domain") or "")]
@@ -276,7 +311,11 @@ class State:
     def load(self):
         if self.path.exists():
             try:
-                self.done = json.loads(self.path.read_text(encoding="utf-8"))
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                # v1.6: 顶层必须是 dict。文件写坏成 [] / null / "abc" 时,
+                # 旧版直接赋给 self.done, 之后 has()/mark() 在 list 上 .pop /
+                # [key]= 要么 TypeError 要么悄悄写进错误结构, 全盘统计错乱。
+                self.done = data if isinstance(data, dict) else {}
             except Exception:
                 self.done = {}
 
@@ -380,7 +419,9 @@ class Downloader(threading.Thread):
         if not aw:
             self.log(f"  ! 重试 {aid}: 拿不到视频信息")
             return False
-        self.q.put((aw, "重试"))
+        # v1.6: 走 submit() 而不是直接 q.put(), 让面板收到 add_waiting,
+        # 用户能在队列里看到这条正在重试, 而不是"点了没动静"。
+        self.submit(aw, "重试")
         return True
 
     def process(self, aweme: dict, source: str):
@@ -468,20 +509,36 @@ class Downloader(threading.Thread):
         stem = build_filename(info)
         dest_dir = get_out_dir()
         # 面板里开了「按作者分文件夹」就归类: 下载目录/作者名/xxx.mp4
+        # v1.6: 必须基于 get_out_dir() 而非旧全局 OUT_DIR, 否则面板里改了下载目录
+        # 后, 普通视频写新目录、按作者归类的却还写旧目录, 用户找不到文件。
         if info.author and load_settings(SETTINGS_FILE).get("by_author"):
             safe = "".join(ch for ch in info.author if ch not in '\\/:*?"<>|').strip() or "未知作者"
-            dest_dir = OUT_DIR / safe[:40]
-            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest_dir = get_out_dir() / safe[:40]
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+            except Exception as _e:
+                self.log(f"  ! 作者目录建不出来({_e}), 直接用下载根目录")
+                dest_dir = get_out_dir()
         dest = dest_dir / f"{stem}.mp4"
 
-        # 已经有同名文件(可能是上次没记进 state)就直接登记
+        # 已经有同名文件(可能是上次没记进 state)就直接登记。
+        # v1.6: 但得先确认它真是个视频 —— 旧版只看 size>0, 一个上次下载
+        # 中断留下的半截 .part 改名、或 403 存下来的 HTML 错误页, 会被当成
+        # "已完成"永久登记, 以后再也不会重下, 用户永远缺这一条。
         if dest.exists() and dest.stat().st_size > 0:
-            self.log(f"  已存在, 跳过: {dest.name}")
-            self.state.mark(info.aweme_id, dest, f"{res}")
-            self.count_skip += 1
-            self._ev("pop_waiting", info.aweme_id)
-            self._ev("skip")
-            return
+            if not verify_video(dest):
+                self.log(f"  ! 已存在的 {dest.name} 不是有效视频, 删掉重下")
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+            else:
+                self.log(f"  已存在, 跳过: {dest.name}")
+                self.state.mark(info.aweme_id, dest, f"{res}")
+                self.count_skip += 1
+                self._ev("pop_waiting", info.aweme_id)
+                self._ev("skip")
+                return
 
         self.log(f"  下载中 -> {dest_dir.name}/{dest.name}")
         self._ev("begin", info.aweme_id, {
@@ -502,6 +559,10 @@ class Downloader(threading.Thread):
                         on_progress=lambda d, t: self._ev("progress", aid, d, t)):
                 ok = True
                 best = cand
+                # v1.6: 退到备用候选后, res 还停在 order[0] 的画质, 结果
+                # state.json 和 _meta 把"实际下到的 720p"记成"首选的 1080p",
+                # 以后重看/统计全错。用真正下成功的这个候选重算一次。
+                res = f"{best.width}x{best.height}" if best.width else res
                 break
         if not ok:
             self.log("  × 所有候选地址都下载失败")
@@ -556,9 +617,12 @@ class Downloader(threading.Thread):
             ],
             "downloaded_at": int(time.time()),
         }
-        meta_dir = get_out_dir() / "_meta"
-        meta_dir.mkdir(parents=True, exist_ok=True)
+        # v1.6: 目录创建和写入一起进 try。旧版 mkdir 在 try 外, 目录建不出来
+        # (盘拔了/权限变了)会抛异常打断整个 process(), 明明视频已经下好了却
+        # 走不到 state.mark(), 下次启动又把它当下过一遍 —— 白下还占空间。
         try:
+            meta_dir = get_out_dir() / "_meta"
+            meta_dir.mkdir(parents=True, exist_ok=True)
             (meta_dir / f"{info.aweme_id}.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -568,7 +632,14 @@ class Downloader(threading.Thread):
     def _save_images(self, info: VideoInfo):
         """图文作品: 逐张下原图。"""
         folder = get_out_dir() / build_filename(info)
-        folder.mkdir(parents=True, exist_ok=True)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except Exception as _e:
+            self.log(f"  ! 图文目录建不出来({_e}), 跳过这条图文")
+            self.count_fail += 1
+            self._ev("pop_waiting", info.aweme_id)
+            self._ev("finish", info.aweme_id, False)
+            return
         ok = 0
         for i, u in enumerate(info.image_urls, 1):
             ext = ".jpg"
@@ -595,29 +666,41 @@ class Downloader(threading.Thread):
 # ---------------------------------------------------------------------------
 
 def download_single(url: str, state: State) -> int:
-    """
-    直接下载一个链接。
-    先用 yt-dlp 抓详情(它内置了抖音解析), 失败再提示需要用 --watch 模式。
-    """
+    """直接下载一个链接: 用 yt-dlp 抓详情(它内置了抖音解析)。"""
     import subprocess
 
     log(f"解析链接: {url}")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    dest_dir = get_out_dir()          # v1.6: 跟随设置里的下载目录, 别用旧全局 OUT_DIR
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as _e:
+        log(f"  ! 输出目录 {dest_dir} 建不出来({_e}), 下载无法继续")
+        return 1
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--no-playlist",
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
-        "-o", str(OUT_DIR / "%(uploader)s_%(title).70B_%(id)s.%(ext)s"),
+        "-o", str(dest_dir / "%(uploader)s_%(title).70B_%(id)s.%(ext)s"),
         "--print", "after_move:filepath",
         "--no-warnings",
         url,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=300)
+    except FileNotFoundError:
+        log("  ! 找不到 yt-dlp, 请先执行: pip install -r requirements.txt")
+        return 1
+    except subprocess.TimeoutExpired:
+        log("  ! yt-dlp 超过 5 分钟没结束, 已中止")
+        return 1
     if r.returncode != 0:
         err_lines = [x for x in (r.stderr or "").strip().splitlines() if x.strip()]
         log("  ! yt-dlp 解析失败:")
         log("    " + (err_lines[-1] if err_lines else f"退出码 {r.returncode}, 无错误输出"))
+        # v1.6: 旧提示指向根本不存在的 --watch 模式, 改成人话。
+        log("    该链接可能需要登录态/已失效; 普通收藏请直接双击 启动收藏下载.bat 后在抖音点收藏")
         return 1
     for line in (r.stdout or "").splitlines():
         if line.strip():
@@ -705,17 +788,29 @@ def _has_live_watcher() -> bool:
     """有没有真的 douyin_dl.py 进程在跑(按命令行匹配, 不看锁文件)。
 
     注意 daemon 守护模式下下载进程跑在 pythonw.exe 里, 只查 python.exe 会漏,
-    然后误判"没有活进程"把残留锁删掉, 造成两个守护各拉起一个监听互相抢。"""
+    然后误判"没有活进程"把残留锁删掉, 造成两个守护各拉起一个监听互相抢。
+
+    v1.6: wmic 在 Win11 24H2 起已被系统移除, 一旦 wmic 不存在, 旧版 except
+    返回 False -> 每次都以为没有活进程 -> 把别人的活锁删掉 -> 双实例互抢。
+    改用 PowerShell Get-CimInstance; 更关键的是**探测失败时保守返回 True**
+    (宁可这次不启动、提示用户, 也不能删掉一个可能还活着的锁)。"""
     try:
         import subprocess
+        ps = (
+            "Get-CimInstance Win32_Process -Filter "
+            "\"name='python.exe' or name='pythonw.exe'\" | "
+            "Select-Object -ExpandProperty CommandLine"
+        )
         out = subprocess.run(
-            ["wmic", "process", "where",
-             "name='python.exe' or name='pythonw.exe'", "get", "commandline"],
-            capture_output=True, text=True, timeout=10,
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-Command", ps],
+            capture_output=True, text=True, timeout=12,
         ).stdout.lower()
         return "douyin_dl.py" in out or "daemon.py" in out
     except Exception:
-        return False  # 探测失败时保守认为没有, 允许覆盖残留锁
+        # 探测失败(超时/PowerShell 被策略拦): 保守认为"可能有活进程",
+        # 绝不删锁。最坏是这次启动被挡一下, 好过双实例互相抢同一浏览器。
+        return True
 
 
 _LOCK = None
@@ -740,7 +835,10 @@ def main():
     ap.add_argument("--no-open", action="store_true", help="启动面板但不要自动打开浏览器")
     args = ap.parse_args()
 
-    global OUT_DIR
+    global OUT_DIR, _CDP_PORT
+    # v1.6: 用户可能用 --port 指定非 9222 的调试端口。常驻无头浏览器读 cookie、
+    # 切窗口都走模块级 _CDP_PORT, 这里必须同步, 否则自定义端口时详情地址 403。
+    _CDP_PORT = args.port
     # 启动时: 命令行 --output 优先, 其次设置文件里的 out_dir, 最后工作区/downloads
     settings0 = load_settings(SETTINGS_FILE)
     if args.output:
@@ -751,7 +849,17 @@ def main():
         OUT_DIR = Path(str(settings0["out_dir"])).expanduser()
         if not OUT_DIR.is_absolute():
             OUT_DIR = (WORKSPACE / OUT_DIR).resolve()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    # v1.6: 目录建不出来(盘拔了/网络盘断了/没权限)不能让整个程序启动就崩,
+    # 更不能把一个已经写回设置的坏 out_dir 留着反复坑用户。回落默认目录并提示。
+    try:
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as _e:
+        log(f"  ! 输出目录 {OUT_DIR} 建不出来({_e}), 回落到 {WORKSPACE / 'downloads'}")
+        OUT_DIR = WORKSPACE / "downloads"
+        try:
+            OUT_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
     state = State(STATE_FILE)
     session = build_session()
@@ -770,12 +878,35 @@ def main():
     # 延迟导入, 避免 --url 模式也要加载 playwright
     from douyin_dl.watcher import BrowserWatcher
 
+    # v1.6: --check 是纯检查, 必须放在所有副作用之前 —— 旧版它在抢锁、
+    # 开面板、起下载线程之后, 结果"只是查个登录状态"却把 8899 面板弹了出来、
+    # 还占了实例锁, 检查完也不干净。现在只起一次浏览器查 cookie 就退出。
+    if args.check:
+        _wc = BrowserWatcher(profile_dir=PROFILE_DIR, port=args.port, log=log,
+                             headless=args.headless)
+        if not _wc.start_chrome():
+            return 2
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as p:
+                b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
+                ctx = b.contexts[0] if b.contexts else b.new_context()
+                ok = BrowserWatcher.check_login(ctx)
+                # 注意: 这是用户真实在用的 Chrome(带所有标签页), 检查完
+                # 只靠 sync_playwright 上下文退出时断开连接即可, 绝不 b.close()
+                # 去动用户的浏览器。
+        except Exception as _e:
+            log(f"  ! 检查登录出错: {_e}")
+            return 2
+        log(f"  登录状态: {'✔ 已登录' if ok else '✘ 未登录'}")
+        return 0 if ok else 1
+
     # 锁必须放在开面板/弹浏览器之前: 不然双击两次会把面板也起两份
     # (旧顺序里第二次启动已经把面板/浏览器弹出来了才在这里退出)。
     _LOCK = _acquire_instance_lock()
     if _LOCK is None:
         log("  ! 已经有一个下载进程在运行了, 这次不重复启动")
-        if _focus_existing_window():
+        if _focus_existing_window(port=args.port):
             log("    已经把抖音窗口切到前面了, 直接刷就行")
         else:
             log("    没找到正在运行的抖音窗口: 请把原来那个黑色窗口关掉, 再双击启动一次")
@@ -810,19 +941,6 @@ def main():
     )
     watcher.on_fail = lambda aid, why: bus.fail(aid, why)   # 抓不到详情也能在面板失败列表里看到
 
-    if args.check:
-        # 只检查登录: 起浏览器 -> 查 cookie -> 退出
-        if not watcher.start_chrome():
-            return 2
-        from playwright.sync_api import sync_playwright
-
-        with sync_playwright() as p:
-            b = p.chromium.connect_over_cdp(f"http://127.0.0.1:{args.port}")
-            ctx = b.contexts[0] if b.contexts else b.new_context()
-            ok = BrowserWatcher.check_login(ctx)
-        log(f"  登录状态: {'✔ 已登录' if ok else '✘ 未登录'}")
-        return 0 if ok else 1
-
     if args.download_all:
         log("  模式: 先补下现有收藏, 再进入监听")
         watcher.download_all_on_start = True
@@ -831,7 +949,10 @@ def main():
 
     # v1.4: 自动下推荐页(设置里开关, 默认关)。启动时读设置, 面板改设置时实时切换。
     _conf0 = load_settings(SETTINGS_FILE)
-    watcher.auto_recommend = bool(_conf0.get("auto_rec", False))
+    # v1.6: 用 ui 的类型归一化, 别用裸 bool() —— bool("false") 是 True,
+    # 设置文件里一旦被写进字符串 "false"/"0"(老版本/手动改过), 开关就反着来。
+    _as_bool = getattr(ui_mod, "_as_bool", lambda v, d=False: bool(v))
+    watcher.auto_recommend = _as_bool(_conf0.get("auto_rec", False), False)
     # v1.5: 自动翻页间隔(秒), 设置里可调, 默认 3 秒
     _clamp_gap = getattr(ui_mod, "_clamp_gap", None)
     try:
@@ -842,12 +963,24 @@ def main():
         watcher.auto_advance_gap = _clamp_gap(watcher.auto_advance_gap)
     if watcher.auto_recommend:
         log(f"  模式: 自动下载推荐页视频已开启(每 {watcher.auto_advance_gap:g} 秒自动翻一条, 设置里可随时关)")
-    bus.on_auto_rec = lambda v: setattr(watcher, "auto_recommend", bool(v))
-    bus.on_auto_gap = lambda g: setattr(watcher, "auto_advance_gap", float(g))
-    watcher.auto_advance = bool(_conf0.get("auto_adv", True))
-    bus.on_auto_adv = lambda v: setattr(watcher, "auto_advance", bool(v))
+    bus.on_auto_rec = lambda v: setattr(watcher, "auto_recommend", _as_bool(v, False))
+    bus.on_auto_gap = lambda g: setattr(watcher, "auto_advance_gap", _clamp_gap(g) if _clamp_gap else float(g))
+    watcher.auto_advance = _as_bool(_conf0.get("auto_adv", True), True)
+    bus.on_auto_adv = lambda v: setattr(watcher, "auto_advance", _as_bool(v, True))
     # 翻页要有背压: 队列堵了就先别往下滑, 否则积压会无限长
     watcher.queue_probe = lambda: dl.q.qsize()
+    # v1.6: 面板里改下载目录后, ui.py 发 on_out_dir(Path) 回调, 这里同步全局
+    # OUT_DIR, 让日志统计、_focus、按作者归类的兜底都跟上新目录(下载线程本身
+    # 已经每次 get_out_dir(), 但 main 里的 OUT_DIR 还停在启动时那个旧值)。
+    def _on_out_dir(new_dir):
+        global OUT_DIR
+        try:
+            p = Path(new_dir)
+            OUT_DIR = p
+            log(f"  下载目录已切换到: {p}")
+        except Exception:
+            pass
+    bus.on_out_dir = _on_out_dir
 
     rc = 0
     try:

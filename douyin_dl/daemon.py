@@ -16,10 +16,13 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 MAIN = WORKSPACE / "douyin_dl.py"
+# 守护自己的日志单独放一份, 别和主程序的 douyin_dl.log 抢(那个文件主程序会做 5MB 轮转)
+DAEMON_LOG = WORKSPACE / "daemon.log"
 
 # 活不过这个秒数算「秒退」, 连续秒退太多次就放弃
 RAPID_EXIT_SECS = 60
@@ -29,6 +32,27 @@ RESTART_DELAY = 5
 EXIT_INTENTIONAL = 7
 
 
+def _log(msg: str) -> None:
+    """写一行带时间戳的日志到 daemon.log。
+
+    守护是被 pythonw.exe 拉起的: pythonw 下 sys.stdout is None,
+    裸 print 会直接抛异常 / 静默丢失, 秒退重启日志一行都看不到。
+    所以日志必须落盘; 整个写文件用 try/except 兜住 —— 日志本身
+    失败(写不进去、磁盘满等)也绝不能让守护崩。
+    """
+    try:
+        with open(DAEMON_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
+    # 前台 python 启动时顺便留一份到控制台; pythonw 下 stdout 为空就跳过
+    try:
+        if sys.stdout is not None:
+            print(msg, flush=True)
+    except Exception:
+        pass
+
+
 def _python_exe() -> str:
     return sys.executable or "python"
 
@@ -36,26 +60,34 @@ def _python_exe() -> str:
 def guard():
     rapid = 0
     n = 0
-    print(f"[daemon] 守护启动, 目标: {MAIN}", flush=True)
+    _log(f"[daemon] 守护启动, 目标: {MAIN}")
     while True:
         n += 1
-        print(f"[daemon] 第 {n} 次启动下载进程…", flush=True)
+        _log(f"[daemon] 第 {n} 次启动下载进程…")
         t0 = time.time()
         try:
+            # v1.6: 把 启动收藏下载.bat 的 %* 透传给主程序。
+            # 以前写死 "--no-open", 用户加的 --check/--port/--output 全被吞掉,
+            # bat 里加了 %* 也没用(参数只到守护, 到不了 douyin_dl.py)。
+            # 守护自己不需要任何参数, 所以 sys.argv[1:] 整份转下去;
+            # --no-open 必须保留(守护拉起时别弹浏览器, 面板标签会自动重连),
+            # 用户重复给了也无妨(argparse 的 store_true 不怕重复)。
+            _user_args = [a for a in sys.argv[1:] if a != "--no-open"]
+            _child = [_python_exe(), str(MAIN), *_user_args, "--no-open"]
             proc = subprocess.Popen(
-                [_python_exe(), str(MAIN), "--no-open"],   # 守护拉起不弹面板浏览器, 面板标签还开着会自动重连
+                _child,
                 cwd=str(WORKSPACE),
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
             )
         except Exception as e:
-            print(f"[daemon] 启动失败: {e}", flush=True)
+            _log(f"[daemon] 启动失败: {e}")
             time.sleep(RESTART_DELAY)
             continue
 
         try:
             code = proc.wait()
         except KeyboardInterrupt:
-            print("[daemon] 收到退出信号, 关闭下载进程…", flush=True)
+            _log("[daemon] 收到退出信号, 关闭下载进程…")
             proc.terminate()
             try:
                 proc.wait(timeout=8)
@@ -64,11 +96,11 @@ def guard():
             return
 
         lived = time.time() - t0
-        print(f"[daemon] 下载进程退出 (code={code}, 存活 {lived:.0f}s)", flush=True)
+        _log(f"[daemon] 下载进程退出 (code={code}, 存活 {lived:.0f}s)")
 
         if code == EXIT_INTENTIONAL:
-            print("[daemon] 用户主动关闭(关掉了抖音且自动重开=关), 守护退出。"
-                  "下次双击 启动收藏下载.bat 再开始。", flush=True)
+            _log("[daemon] 用户主动关闭(关掉了抖音且自动重开=关), 守护退出。"
+                 "下次双击 启动收藏下载.bat 再开始。")
             return
 
         if lived >= RAPID_EXIT_SECS:
@@ -76,8 +108,8 @@ def guard():
         else:
             rapid += 1
             if rapid >= MAX_RAPID:
-                print(f"[daemon] 连续 {rapid} 次秒退, 放弃守护。"
-                      f"请看 douyin_dl.log 里最新的报错。", flush=True)
+                _log(f"[daemon] 连续 {rapid} 次秒退, 放弃守护。"
+                     f"请看 douyin_dl.log 里最新的报错。")
                 return
         time.sleep(RESTART_DELAY)
 

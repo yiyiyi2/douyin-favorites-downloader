@@ -33,6 +33,32 @@ from playwright.sync_api import sync_playwright
 
 from douyin_dl.core import UA
 
+# 主循环退出码。daemon.py 只把 EXIT_INTENTIONAL(7) 当"用户主动关, 别再拉起",
+# 其他码一律按"崩了"处理并重启。裸 return 会返回 None -> sys.exit(None)=0,
+# 从命令行跑时看着像"正常成功", 排障会被误导, 所以每个失败出口都给明确非零码。
+EXIT_OK = 0                 # 正常结束
+EXIT_BROWSER_FAIL = 2       # 浏览器起不来 / 连不上(和 --check 一致)
+EXIT_LOGIN_TIMEOUT = 3      # 等扫码登录超时
+EXIT_INTENTIONAL = 7        # 用户主动关闭(与 daemon.py 的 EXIT_INTENTIONAL 一致)
+
+# 无界 set 的上限。跑几天几夜时 known_favs/_auto_submitted 会一直涨, 吃内存;
+# 到顶就砍掉一批。集合无序, 被砍掉的 id 下次再出现会被当"新"的重新提交,
+# 但 Downloader.submit 会按 .state.json 去重, 不会真的重下, 所以安全。
+_SET_CAP_FAVS = 50000
+_SET_CAP_AUTO = 20000
+_SET_CAP_RESOLVING = 2000
+
+
+def _cap_set(s: set, limit: int) -> int:
+    """集合超过 limit 就删掉多出来的(任意顺序), 返回删除个数。"""
+    over = len(s) - limit
+    if over <= 0:
+        return 0
+    for x in list(s)[:over]:
+        s.discard(x)
+    return over
+
+
 # ---------------------------------------------------------------------------
 # 注入脚本
 #
@@ -40,12 +66,12 @@ from douyin_dl.core import UA
 # writable —— 否则抛 "Invalid property descriptor", 钩子会静默失效。
 # 这个坑踩过一次, 这里保持正确写法。
 # ---------------------------------------------------------------------------
-HOOK_VER = 7   # 与 HOOK_JS 里的 const HOOK_VER 保持一致
+HOOK_VER = 8   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
 
 HOOK_JS = r"""
 (() => {
   // 版本号: 改动钩子逻辑就 +1, 否则页面里的旧版本会靠守卫把新版本挡掉(踩过坑)
-  const HOOK_VER = 7;
+  const HOOK_VER = 8;
   if (window.__DY_HOOK_VER__ === HOOK_VER) return;
   // 需要搭便车的接口
   const DATA_EP = [
@@ -152,7 +178,14 @@ HOOK_JS = r"""
   // 不走网络, 因此不会被抖音 CSP 的 connect-src 拦掉(用 fetch 打本地端口会 ERR_FAILED)。
   const send = (kind, url, text, reqBody) => {
     try {
-      if (text && text.length > 8 * 1024 * 1024) text = text.slice(0, 4096);
+      // v1.6: 千万别把大 JSON 截断成前 4096 字符 —— 那会变成无效 JSON,
+      // Python 侧 extract_awemes 直接返回空, 收藏列表基线/缓存全失效(踩过坑)。
+      // 收藏列表/详情几 MB 很常见, 整份传过去就行(expose_binding 是字符串通道)。
+      // 只有极端异常(>32MB)才放弃正文并打标记, 让 Python 记一行日志而不是静默。
+      if (text && text.length > 32 * 1024 * 1024) {
+        kind = "oversize";
+        text = "";
+      }
       if (typeof window.__dyReport !== "function") return;
       window.__dyReport(JSON.stringify({
         kind: kind, url: url, body: text || "", req: reqBody || "",
@@ -176,20 +209,25 @@ HOOK_JS = r"""
     const req = args[0];
     const url = typeof req === "string" ? req : (req && req.url) || "";
     const kind = classify(url);
-    let reqBody = "";
+    // v1.6: 请求体可能要异步读(Request.clone().text()), 必须和响应正文一起
+    // Promise.all 等齐再上报。旧写法里 reqBody 由另一个 then 异步回填,
+    // 响应先回来时 send 拿到的还是空串 -> POST 收藏漏下载(踩过坑)。
+    let bodyPromise = Promise.resolve("");
     if (kind) {
       // 两种写法都要抓: fetch(new Request(...)) 和 fetch(url, {method, body})
       const init = args[1] || {};
-      if (typeof init.body === "string") reqBody = init.body;
+      if (typeof init.body === "string") bodyPromise = Promise.resolve(init.body);
       else if (typeof req !== "string" && req && typeof req.clone === "function") {
-        try { req.clone().text().then((t) => { reqBody = t; }).catch(() => {}); } catch (e) {}
+        try { bodyPromise = req.clone().text(); } catch (e) {}
       }
     }
     const p = realFetch(...args);
     if (kind) {
       p.then((res) => {
         try {
-          res.clone().text().then((t) => send(kind, url, t, reqBody)).catch(() => {});
+          Promise.all([res.clone().text(), bodyPromise]).then((pair) => {
+            send(kind, url, pair[0], pair[1] || "");
+          }).catch(() => {});
         } catch (e) {}
       }).catch(() => {});
     }
@@ -249,52 +287,121 @@ HOOK_JS = r"""
 # 从响应里挖 aweme
 # ---------------------------------------------------------------------------
 
+# v1.6: 抖音的字段名一直在变。把这些候选名集中管理, 别在四个函数里各写一套,
+# 免得 core.py 支持 awemeId 而 watcher.py 只认 aweme_id, 直接漏下载。
+_ID_KEYS = ("aweme_id", "awemeId", "item_id", "itemId", "object_id", "group_id", "id")
+_VIDEO_KEYS = ("video", "images", "image_list", "video_info", "play_addr", "aweme_detail")
+_ID_LIST_KEYS = ("aweme_ids", "item_ids", "aweme_list", "awemeIdList", "ids")
+
+
+def _norm_id(v: Any) -> str:
+    """把任意形态的 id 归一化成字符串。抖音 id 现在是 19 位数字, 但将来
+    可能带前缀/变短/变字符串 —— 别写死 len>=15, 只要"看着像个 id"就收。"""
+    if isinstance(v, bool):
+        return ""
+    # v1.6: 容器类型的 str() 会变成 "['a']"/"[1]" 这种看着像 id 的垃圾
+    # (无空格、长度合规, 旧版会把它当成一个真 id 收进去)。先按类型挡掉。
+    if isinstance(v, (dict, list, tuple, set)):
+        return ""
+    if isinstance(v, float):
+        if not (v == v and abs(v) < 1e30):   # NaN/Inf
+            return ""
+        v = int(v)
+    s = str(v or "").strip()
+    if not s:
+        return ""
+    # 纯数字 id: 不再写死长度(老代码 len>=15 会把测试/短 id/将来变短的 id 全挡掉)。
+    # 这些值只会出现在明确的 id 键里, 短一点也不必怕误判。
+    if s.isdigit():
+        return s
+    # 非纯数字(将来换成带前缀/哈希的 id): 只要不是超长垃圾就收
+    return s if 1 <= len(s) <= 64 and not any(c.isspace() for c in s) else ""
+
+
+def _action_norm(v: Any) -> str:
+    """把 action 归一化成 "1"(收藏)/"0"(取消)/""(无关)。
+
+    v1.6: 以前只认 str(v) in ("0","1"), 布尔 True 变 "True" 不匹配,
+    字符串 "collect"/"favorite" 也不认 —— 接口一改就整条收藏链没反应。"""
+    if v is None or isinstance(v, (dict, list)):
+        return ""
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    s = str(v).strip().lower()
+    if s in ("1", "true", "collect", "favorite", "favourite", "add", "like", "yes"):
+        return "1"
+    if s in ("0", "false", "uncollect", "unfavorite", "cancel", "remove", "delete", "no"):
+        return "0"
+    return ""
+
+
 def extract_awemes(obj: Any) -> list[dict]:
-    """递归找出所有 aweme 对象(带 aweme_id 且有 video/images/desc)。"""
+    """递归找出所有 aweme 对象(id 字段 + 视频/图集字段)。
+
+    v1.6: 闸门放宽 —— id 认别名, 视频认别名; 即使将来 aweme 被包一层、
+    或 video 改名, 也照样能把整条候选挖出来, 不至于"以后一变就全不下"。"""
     found: list[dict] = []
+    seen: set[int] = set()
+
+    def looks_like_aweme(node: dict) -> bool:
+        has_id = any(k in node and _norm_id(node.get(k)) for k in _ID_KEYS)
+        has_video = any(k in node for k in _VIDEO_KEYS)
+        return has_id and has_video
 
     def walk(node: Any, depth: int = 0):
-        if depth > 12:
+        if depth > 14:
             return
         if isinstance(node, dict):
-            if "aweme_id" in node and ("video" in node or "images" in node):
-                found.append(node)
+            if looks_like_aweme(node):
+                if id(node) not in seen:
+                    seen.add(id(node))
+                    found.append(node)
                 return
             for v in node.values():
                 walk(v, depth + 1)
         elif isinstance(node, list):
             for v in node:
                 walk(v, depth + 1)
+        elif isinstance(node, str):
+            # 有时候整段 aweme 是 JSON 字符串(嵌在别的字段里), 试着解一次
+            t = node.strip()
+            if t.startswith("{") and len(t) < 4 * 1024 * 1024:
+                try:
+                    walk(json.loads(t), depth + 1)
+                except Exception:
+                    pass
 
     walk(obj)
     return found
 
 
 def collect_ids(obj: Any) -> list[str]:
-    """
-    从收藏动作的响应/请求体里找出 aweme_id。
-    抖音这几个接口结构不太统一, 这里广撒网。
-    """
+    """从收藏动作的响应/请求体里找出 aweme_id。接口结构不统一, 广撒网。"""
     ids: list[str] = []
 
     def add(v):
-        s = str(v or "").strip()
-        if s.isdigit() and len(s) >= 15 and s not in ids:
-            ids.append(s)
+        t = _norm_id(v)
+        if not t:
+            return
+        # 纯数字短值(aweme_type=0 / type=0 / "123")是枚举噪音, 保留长度闸门;
+        # 但非纯数字(将来 id 换成带前缀/哈希的字符串)一律收, 不再因长度被挡。
+        if t.isdigit() and len(t) < 15:
+            return
+        if t not in ids:
+            ids.append(t)
 
     def walk(node: Any, depth: int = 0):
-        if depth > 8:
+        if depth > 10:
             return
         if isinstance(node, dict):
-            for k in ("aweme_id", "awemeId", "item_id", "itemId", "object_id"):
+            for k in _ID_KEYS:
                 if k in node:
                     add(node[k])
-            # 列表型字段
-            for k in ("aweme_ids", "item_ids", "aweme_list"):
+            for k in _ID_LIST_KEYS:
                 v = node.get(k)
                 if isinstance(v, list):
                     for x in v:
-                        if isinstance(x, (str, int)):
+                        if isinstance(x, (str, int)) and not isinstance(x, bool):
                             add(x)
                         else:
                             walk(x, depth + 1)
@@ -304,6 +411,11 @@ def collect_ids(obj: Any) -> list[str]:
         elif isinstance(node, list):
             for v in node:
                 walk(v, depth + 1)
+        elif isinstance(node, str) and node.strip().startswith("{"):
+            try:
+                walk(json.loads(node), depth + 1)
+            except Exception:
+                pass
 
     walk(obj)
     return ids
@@ -317,48 +429,51 @@ def ids_from_url(url: str) -> list[str]:
     except Exception:
         return ids
     for k, v in parse_qsl(qs, keep_blank_values=False):
-        if k.lower() in ("aweme_id", "item_id", "object_id", "group_id"):
-            s = str(v).strip()
-            if s.isdigit() and len(s) >= 15 and s not in ids:
-                ids.append(s)
+        if k.lower() in ("aweme_id", "awemeid", "item_id", "itemid",
+                         "object_id", "group_id", "id"):
+            t = _norm_id(v)
+            if t and t not in ids:
+                ids.append(t)
     return ids
 
 
 def action_from_url(url: str) -> str:
-    """从 query 里取 action。取不到返回空串。"""
+    """从 query 里取 action 并归一化。取不到返回空串。"""
     try:
         qs = url.split("?", 1)[1] if "?" in url else ""
     except Exception:
         return ""
     for k, v in parse_qsl(qs, keep_blank_values=False):
-        if k.lower() in ("action", "collect_action"):
-            return str(v).strip()
+        if k.lower() in ("action", "collect_action", "collectaction", "favorite_action"):
+            a = _action_norm(v)
+            if a:
+                return a
     return ""
 
 
 def action_value(url: str, body: Any = None, req: Any = None) -> str:
-    """
-    这次收藏接口调用到底在干什么。
+    """这次收藏接口调用到底在干什么, 返回 "1"/"0" 或空串。
 
     实测(2026-11-10, 用 data-e2e-state 对照验证过):
-        action=1  ->  收藏   (点前 video-player-no-collect, 点后 video-player-is-collected)
-        action=0  ->  取消收藏
-    注意别再按直觉反过来写: 早期就是把它当反的, 导致每次真收藏都被当成取消跳过。
-
-    返回 "1"/"0", 或者空串(这类请求是页面自己发的状态同步, 不带 action)。
-    """
+       action=1 -> 收藏; action=0 -> 取消收藏。别再按直觉反过来写。
+    v1.6: 归一化布尔/字符串别名, 且 url 里没有就翻 req 再翻 body
+    (收藏动作的参数更常在请求体里, 而不是响应体)。"""
     a = action_from_url(url or "")
-    if not a:
-        for src in (body, req):
-            if isinstance(src, dict):
-                for k in ("action", "collect_action"):
-                    v = src.get(k)
-                    if v is not None and str(v) in ("0", "1"):
-                        a = str(v)
-                        break
-            if a:
-                break
-    return a
+    if a:
+        return a
+    for src in (req, body):
+        if isinstance(src, str) and src.strip().startswith(("{", "[")):
+            try:
+                src = json.loads(src)
+            except Exception:
+                pass
+        if isinstance(src, dict):
+            for k in ("action", "collect_action", "collectAction", "favorite_action"):
+                v = src.get(k)
+                a = _action_norm(v)
+                if a:
+                    return a
+    return ""
 
 
 def is_uncollect(url: str, body: Any, req: Any) -> bool:
@@ -371,16 +486,59 @@ def is_uncollect(url: str, body: Any, req: Any) -> bool:
 # ---------------------------------------------------------------------------
 
 def find_chrome() -> str | None:
-    cands = []
+    """找 Chrome / Edge 可执行文件。
+
+    v1.6: 以前只查 CHROME_PATH + 4 个写死的安装路径。用户把浏览器装在
+    D 盘、用 Chromium、或 Win11 改了默认位置就找不到, 直接"启动不了"。
+    现在补上注册表 App Paths、%LOCALAPPDATA%、PATH(shutil.which),
+    并接受更多常见的可执行名。"""
+    import shutil
+
+    names = ["chrome.exe", "msedge.exe", "chromium.exe", "chrome-beta.exe"]
+    cands: list[str] = []
     env = os.environ.get("CHROME_PATH")
     if env:
         cands.append(env)
-    cands += [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-    ]
+    # 用户级安装(Chrome/Edge 都支持 per-user install)
+    la = os.environ.get("LOCALAPPDATA") or ""
+    pf = os.environ.get("ProgramFiles") or r"C:\Program Files"
+    pf86 = os.environ.get("ProgramFiles(x86)") or r"C:\Program Files (x86)"
+    for base, sub in (
+        (la, r"Google\Chrome\Application\chrome.exe"),
+        (la, r"Microsoft\Edge\Application\msedge.exe"),
+        (la, r"Chromium\Application\chrome.exe"),
+        (pf, r"Google\Chrome\Application\chrome.exe"),
+        (pf86, r"Google\Chrome\Application\chrome.exe"),
+        (pf, r"Microsoft\Edge\Application\msedge.exe"),
+        (pf86, r"Microsoft\Edge\Application\msedge.exe"),
+        (pf, r"Chromium\Application\chrome.exe"),
+    ):
+        if base:
+            cands.append(str(Path(base) / sub))
+    # 注册表里登记的 App Paths(安装程序一定会写)。非 Windows 没有 winreg,
+    # 整段包 try, 缺了就当没有这一路。
+    try:
+        import winreg
+        for key in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"):
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(hive, key) as k:
+                        val, _ = winreg.QueryValueEx(k, "")
+                        if val:
+                            cands.append(str(val).strip('"'))
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    # 最后再扫一遍 PATH
+    for n in names:
+        try:
+            got = shutil.which(n)
+            if got:
+                cands.append(got)
+        except Exception:
+            pass
     for c in cands:
         if c and Path(c).exists():
             return c
@@ -433,7 +591,11 @@ class BrowserWatcher:
         # 关掉它就只是"推荐页流量里出现什么就下什么", 不主动滑页面。
         self.auto_advance = True
         self.auto_advance_gap = 3.0
-        self._last_advance = 0.0
+        # v1.6: 不能用 0.0 —— monotonic() 是"开机至今的秒数"(通常是几十万),
+        # 0.0 会让第一次进主循环就满足 now-0>=gap 立刻翻页, 用户刚打开、
+        # 还没看到第一条就被动跳过。初始化成 monotonic(), 先给用户一整个 gap
+        # 的时间看第一条(首屏 feed 请求本来就会被钩子抓住并下载)。
+        self._last_advance = time.monotonic()
         # 队列深度探针(主程序注入 lambda: dl.q.qsize())。
         # 翻页节奏可以比下载快很多 —— 每翻一次能塞进来 6 个视频,
         # 而抓详情+下载一个要几秒。积压太多就先停翻, 免得队列越滚越长。
@@ -582,6 +744,11 @@ class BrowserWatcher:
                     fresh_baseline = not self.baseline_done
                     self.baseline_done = True
                     self.known_favs.update(ids)
+                    # v1.6: 长跑防内存膨胀。被砍掉的旧 id 再出现会被当"新",
+                    # 但 Downloader.submit 按 .state.json 去重, 不会真的重下。
+                    if len(self.known_favs) > _SET_CAP_FAVS:
+                        _cap_set(self.known_favs, _SET_CAP_FAVS)
+                        self.log(f"  · 收藏基线集合已满({_SET_CAP_FAVS}), 淘汰最旧一批")
 
                 if fresh_baseline:
                     if self.download_all_on_start:
@@ -613,6 +780,9 @@ class BrowserWatcher:
                             continue
                         self._auto_submitted.add(aid)
                         todo.append(aid)
+                    # v1.6: 同上, 长跑防 _auto_submitted 无限涨
+                    if len(self._auto_submitted) > _SET_CAP_AUTO:
+                        _cap_set(self._auto_submitted, _SET_CAP_AUTO)
                 if todo:
                     self.log(f"  推荐页: 新增 {len(todo)} 个视频进队列 "
                              f"(累计提交 {len(self._auto_submitted)})")
@@ -649,19 +819,23 @@ class BrowserWatcher:
             ids = collect_ids(req) or ids_from_url(url) or collect_ids(body)[:1]
             if not ids:
                 return
-            for aid in ids[:1]:
-                # 只认明确带 action 的请求:
-                #   实测页面自己发的状态同步请求不带 action(req 是 aweme_id=..&item_type=0&type=0),
-                #   带 action=1 的一定是人点了收藏。
-                # 早期用「必须匹配到点击记录」来挡同步请求, 结果连真实点击也一起挡了
-                # (连点两个视频、或按钮在详情浮层里时, 点击记录对不上号) —— 已废弃。
-                _act = action_value(url, body, req)
-                if _act != "1":
-                    self.log(f"  · 忽略状态同步请求 {aid} (没有 action)")
-                    return
-                # 一律重新抓一次详情, 不吃缓存:
-                # 缓存(尤其是收藏列表接口带来的)里的播放地址签名很快失效,
-                # 直接拿去下载会整个视频所有候选都 403。实测重新抓详情后同一个视频立刻能下。
+            # 只认明确带 action 的请求:
+            #   实测页面自己发的状态同步请求不带 action(req 是 aweme_id=..&item_type=0&type=0),
+            #   带 action=1 的一定是人点了收藏。
+            # 早期用「必须匹配到点击记录」来挡同步请求, 结果连真实点击也一起挡了
+            # (连点两个视频、或按钮在详情浮层里时, 点击记录对不上号) —— 已废弃。
+            # v1.6: 这个判断对所有 id 都一样, 提到循环外只算一次, 也避免循环里
+            # 因为 return 提前退出而漏掉同批次的其它视频。
+            _act = action_value(url, body, req)
+            if _act != "1":
+                self.log(f"  · 忽略状态同步请求 {ids[0]} (没有 action)")
+                return
+            # 一律重新抓一次详情, 不吃缓存:
+            # 缓存(尤其是收藏列表接口带来的)里的播放地址签名很快失效,
+            # 直接拿去下载会整个视频所有候选都 403。实测重新抓详情后同一个视频立刻能下。
+            # v1.6: 一次收藏通常只带一个 id; 极端情况下(批量请求)也只取前 8 个,
+            # 免得一个异常请求把待补全队列刷爆。用 continue 语义逐个入队, 不再 ids[:1]。
+            for aid in ids[:8]:
                 with self._lock:
                     if aid not in self._pending_actions:
                         self._pending_actions.append(aid)
@@ -676,11 +850,17 @@ class BrowserWatcher:
         所以这里单独 start() 一个 playwright 实例, 和主循环完全隔离。
         好处是整个过程没有任何窗口, 用户眼前绝对不会跳东西。
         """
+        # v1.6: inflight 记录"正取到一半"的 id。若线程在取详情途中崩了,
+        # 这个 id 已经从 _hl_in 拿出来、不在队列里, 光排空队列会漏掉它,
+        # 主循环得白等 45 秒才超时重排。记下来, 崩溃时一并回 None。
+        inflight: str | None = None
         try:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(
                     headless=True,
-                    channel="chrome",
+                    # v1.6: find_chrome() 可能返回 Edge, 写死 channel="chrome" 会启动失败。
+                    # 不指定 channel 就用 Playwright 自带的 chromium(已随 pip 装好),
+                    # 跨平台最稳; 想用系统 Chrome 时由 executable_path 兜底更可靠。
                     args=[
                         "--disable-blink-features=AutomationControlled",
                         "--mute-audio",
@@ -694,11 +874,29 @@ class BrowserWatcher:
                     locale="zh-CN",
                 )
                 page = ctx.new_page()
+                # v1.6: 复用队列后, 上次线程可能留下一条 None(退出信号)或几个
+                # 没处理完的请求。None 直接丢; 元组回一个 None 让主循环走重排,
+                # 不能在用新 page 处理旧请求时又把旧 None 当成退出信号自己退掉。
+                while True:
+                    try:
+                        stale = self._hl_in.get_nowait()
+                    except queue.Empty:
+                        break
+                    if stale is None:
+                        continue
+                    try:
+                        self._hl_out.put((stale[0], None))
+                    except Exception:
+                        pass
                 while True:
                     item = self._hl_in.get()
                     if item is None:            # 退出信号
                         break
-                    aid, cookies = item
+                    try:
+                        aid, cookies = item
+                    except Exception:
+                        continue                 # 畸形条目, 跳过(不能让整个线程崩)
+                    inflight = aid
                     aw = None
                     try:
                         aw = self._hl_fetch(page, ctx, aid, cookies)
@@ -714,21 +912,32 @@ class BrowserWatcher:
                             except Exception:
                                 break
                     self._hl_out.put((aid, aw))
+                    inflight = None
                 try:
                     browser.close()
                 except Exception:
                     pass
         except Exception as e:
             self.log(f"  ! 无头浏览器启动失败: {str(e)[:90]}")
-            # 让所有排队的请求都拿到 None, 否则主循环会一直等
+            # 让所有排队的请求(含取到一半的)都拿到 None, 否则主循环会一直等。
+            # v1.6: 旧写法 `aid, _ = self._hl_in.get_nowait()` 对 None 哨兵会
+            # TypeError: cannot unpack non-sequence NoneType, 把兜底自己也搞崩。
+            if inflight is not None:
+                try:
+                    self._hl_out.put((inflight, None))
+                except Exception:
+                    pass
             while True:
                 try:
-                    aid, _ = self._hl_in.get_nowait()
+                    item = self._hl_in.get_nowait()
                 except queue.Empty:
                     break
-                if aid is None:
+                if item is None:
                     break
-                self._hl_out.put((aid, None))
+                try:
+                    self._hl_out.put((item[0], None))
+                except Exception:
+                    pass
 
     def _hl_fetch(self, page, ctx, aid, cookies):
         """在无头页面里打开视频, 等 /aweme/detail/ 返回带 aweme_detail 的 JSON。"""
@@ -770,8 +979,14 @@ class BrowserWatcher:
     def _ensure_hl_worker(self):
         if self._hl_thread is not None and self._hl_thread.is_alive():
             return
-        self._hl_in = queue.Queue()
-        self._hl_out = queue.Queue()
+        # v1.6: 两条队列只建一次, 线程重启时复用。旧写法每次都 new 两个 Queue,
+        # 上一个线程崩了/退出时残留的 _hl_in 请求和 _hl_out 结果全成了孤儿 ——
+        # 主循环还在 _resolving 里等那些 id, 结果永远等不到, 白等 45 秒超时。
+        # 复用后新线程的"排空残留"逻辑会给每个残留 id 回一个 None, 主循环立刻重排。
+        if self._hl_in is None:
+            self._hl_in = queue.Queue()
+        if self._hl_out is None:
+            self._hl_out = queue.Queue()
         self._hl_thread = threading.Thread(target=self._hl_loop,
                                            name="dy-headless", daemon=True)
         self._hl_thread.start()
@@ -789,18 +1004,33 @@ class BrowserWatcher:
         try:
             cdp = self._browser.new_browser_cdp_session()
             found = []
-            for t in cdp.send("Target.getTargets")["targetInfos"]:
-                if t.get("type") != "page":
+            # v1.6: CDP 返回的是外部数据, 别裸下标。旧版任意一个字段缺失
+            # (新版 Chrome 改字段、返回 None、targetInfos 不是 list)就 KeyError/
+            # TypeError 直接把这轮清理整个废掉, 还可能让残留窗口越积越多。
+            targets = (cdp.send("Target.getTargets") or {}).get("targetInfos")
+            if not isinstance(targets, list):
+                return
+            for t in targets:
+                if not isinstance(t, dict) or t.get("type") != "page":
+                    continue
+                tid = t.get("targetId")
+                if not isinstance(tid, str) or not tid:
                     continue
                 try:
                     w = cdp.send("Browser.getWindowForTarget",
-                                 {"targetId": t["targetId"]})
-                    bd = cdp.send("Browser.getWindowBounds",
-                                  {"windowId": w["windowId"]})["bounds"]
+                                 {"targetId": tid}) or {}
+                    wid = w.get("windowId")
+                    if wid is None:
+                        continue
+                    bd = (cdp.send("Browser.getWindowBounds",
+                                   {"windowId": wid}) or {}).get("bounds") or {}
+                    if not isinstance(bd, dict):
+                        continue
+                    left = int(bd.get("left") or 0)
                 except Exception:
                     continue
-                if int(bd.get("left") or 0) <= -2000:
-                    found.append(t["targetId"])
+                if left <= -2000:
+                    found.append(tid)
             for tid in found:
                 try:
                     cdp.send("Target.closeTarget", {"targetId": tid})
@@ -873,6 +1103,12 @@ class BrowserWatcher:
         with self._lock:
             pend = [a for a in self._pending_actions if a not in self._resolving]
             self._pending_actions.clear()
+            # v1.6: 详情一直抓不到时 _pending_actions 会被反复放回、越堆越多,
+            # 长跑吃内存。超过上限只留最近的一批(老的就算放弃, 面板会记失败)。
+            if len(pend) > _SET_CAP_RESOLVING:
+                self.log(f"  · 待补全队列过长({len(pend)}), 丢弃最旧的 "
+                         f"{len(pend) - _SET_CAP_RESOLVING} 个")
+                pend = pend[-_SET_CAP_RESOLVING:]
 
         if not pend or self._ctx is None:
             return
@@ -958,7 +1194,16 @@ class BrowserWatcher:
             with urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/json/version", timeout=1
             ) as r:
-                return json.loads(r.read())
+                info = json.loads(r.read())
+                # v1.6: 端口上可能不是 Chrome(别的程序占了、返回了个 JSON 数组
+                # 或 null), 旧版直接 return 非 dict -> start_chrome 里 info.get
+                # AttributeError。只认 dict, 且必须带 Browser/webSocketDebuggerUrl
+                # 才算"可用的 CDP 浏览器"。
+                if not isinstance(info, dict):
+                    return None
+                if not (info.get("Browser") or info.get("webSocketDebuggerUrl")):
+                    return None
+                return info
         except Exception:
             return None
 
@@ -999,7 +1244,10 @@ class BrowserWatcher:
                     f"http://127.0.0.1:{self.port}/json/version", timeout=1
                 ) as r:
                     info = json.loads(r.read())
-                self.log(f"  浏览器已就绪: {info.get('Browser', '')}")
+                if not isinstance(info, dict):
+                    raise ValueError("CDP 返回的不是对象")
+                self._browser_name = info.get("Browser", "") or ""
+                self.log(f"  浏览器已就绪: {self._browser_name}")
                 return True
             except Exception:
                 if self.proc.poll() is not None:
@@ -1009,19 +1257,37 @@ class BrowserWatcher:
         self.log("! 等待调试端口超时")
         return False
 
-    @staticmethod
-    def check_login(ctx) -> bool:
+    # 只列"登录了才会有"的 Cookie。ttwid / passport_csrf_token / msToken /
+    # __ac_signature 游客态也有(实测游客 profile 里就这几个), 绝不能拿来判登录,
+    # 否则会把未登录当已登录, 后面所有请求全是 403 还一头雾水。
+    _LOGIN_COOKIES = frozenset({
+        "sessionid", "sessionid_ss", "sid_tt", "sid_guard",
+        "uid_tt", "uid_tt_ss",
+    })
+
+    @classmethod
+    def check_login(cls, ctx) -> bool:
         try:
-            names = {c["name"] for c in ctx.cookies()}
+            # v1.6: 旧版只认 3 个名字, 抖音改过登录态字段名(sid_guard/uid_tt
+            # 现在也会带), 只守着老三样会偶发"明明登录了却一直让我扫码"。
+            # 名字命中还不够, 值必须非空(有些 Cookie 退出登录后名字还在、值清空)。
+            for c in ctx.cookies():
+                if c.get("name") in cls._LOGIN_COOKIES and c.get("value"):
+                    return True
+            return False
         except Exception:
             return False
-        return bool({"sessionid", "sessionid_ss", "sid_tt"} & names)
 
     # -- 主循环 ------------------------------------------------------------
     def run(self):
-        """跑监听主循环。返回 0 正常结束; 7 = 用户主动关闭(守护看到 7 不再拉起)。"""
+        """跑监听主循环。返回 0 正常结束; 7 = 用户主动关闭(守护看到 7 不再拉起)。
+
+        v1.6: 所有失败出口必须返回明确的非零码。旧版这几处是裸 `return`
+        (返回 None), 在 `sys.exit(main())` 里 None 会被当 0 —— 浏览器起不来
+        这种真故障, 守护却以为"正常退出", 日志里看不到异常, 排障被带偏。
+        """
         if not self.start_chrome():
-            return
+            return EXIT_BROWSER_FAIL
         self._intentional_exit = False
 
         try:
@@ -1064,15 +1330,16 @@ class BrowserWatcher:
                     while time.time() < deadline:
                         time.sleep(2)
                         # Chrome 起来又死了就别干等 10 分钟: 退出让守护重新走一遍流程
-                        if getattr(self, "_browser", None) is not None                                 and not self._browser.is_connected():
+                        if (getattr(self, "_browser", None) is not None
+                                and not self._browser.is_connected()):
                             self.log("! 浏览器在登录等待时关闭了, 监听结束")
-                            return
+                            return EXIT_BROWSER_FAIL
                         self.pump(ctx)
                         if self.check_login(ctx):
                             break
                     if not self.check_login(ctx):
                         self.log("! 登录等待超时, 退出")
-                        return
+                        return EXIT_LOGIN_TIMEOUT
                     self.log("  ✔ 登录成功")
                     time.sleep(2)
                     self._install_hook(page)
@@ -1107,7 +1374,8 @@ class BrowserWatcher:
                 while True:
                     try:
                         # 用户关掉浏览器后, ctx 可能仍然"看着正常", 只有这个能可靠判断
-                        if getattr(self, "_browser", None) is not None                                 and not self._browser.is_connected():
+                        if (getattr(self, "_browser", None) is not None
+                                and not self._browser.is_connected()):
                             # 关掉最后一个抖音 tab 后 Chrome 窗口会消失, is_connected 随之变 False
                             # —— 这才是用户"关掉抖音"的真实路径(而不是下面的 tick%150 分支)。
                             # auto_reopen=关: 视为用户主动关闭, 用退出码 7 告诉守护别再拉起。
@@ -1300,7 +1568,15 @@ class BrowserWatcher:
             try:
                 h = page.evaluate("() => document.body.scrollHeight")
                 page.mouse.wheel(0, 2400)
-                time.sleep(1.2)
+                # v1.6: 旧版整段 120 轮从不 drain(), 钩子塞进 self.queue 的
+                # listcollection 响应全堆着(无上界, 长列表吃内存), 而且
+                # baseline/回补下载要等滚动全结束、主循环起来才处理 ——
+                # 一旦中途异常 break, 这批收藏就整批丢了。每轮顺手排空一次,
+                # 边滚边建基线/回补, 响应也不再堆积。
+                self.pump(self._ctx)
+                self.drain()
+                if self._pending_actions:
+                    self._resolve_pending()
                 if h == last and i > 3:
                     break
                 last = h

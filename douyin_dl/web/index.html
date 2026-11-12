@@ -255,7 +255,7 @@
       <span class="chip" id="t-q">画质: 最高</span>
     </div>
     <div class="grow"></div>
-    <button class="ghost" onclick="toggleLog(true)">查看日志</button>
+    <button class="ghost" onclick="toggleLog(true)">设置 / 日志</button>
     <button class="primary" onclick="openWhat('folder')">下载文件夹</button>
     <button onclick="toggleDrawer(true)">设置</button>
   </div>
@@ -428,7 +428,7 @@ function ago(ts){
   const dt = new Date(ts*1000);
   return (dt.getMonth()+1)+"/"+dt.getDate();
 }
-function esc(s){ return (s||"").replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+function esc(s){ return (s||"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function goTop(){
   // 注意: 这里必须写 window.scrollTo, 写成 scrollTo 会解析到 Element.prototype.scrollTo
   window.scrollTo({top: 0, behavior: "smooth"});
@@ -457,7 +457,7 @@ function thumbHtml(item){
   const ph = `<div class="ph">${ch}</div>`;
   if(!item.id) return ph;
   const src = "/api/thumb?id=" + encodeURIComponent(item.id);
-  // 加载失败时自动重试(最多 5 次, 间隔递增) —— 新记录封面要等服务端去抖音现拉, 第一次容易超时
+  // 加载失败时自动重试(最多 15 次, 间隔递增) —— 新记录封面要等服务端去抖音现拉, 第一次容易超时
   return ph + `<img loading="lazy" src="${src}" onerror="thumbRetry(this)">`;
 }
 
@@ -476,12 +476,21 @@ function thumbRetry(img){
 function render(){
   if(!STATE) return;
   // 服务端字段缺失时兜底, 防止一条异常 SSE 把整个 render 打断
+  // 后端 schema 变化/字段改名/旧版后端都可能少字段, 这里全部补齐再往下用
   STATE.status = STATE.status || {};
   STATE.counters = STATE.counters || {ok:0,skip:0,fail:0};
   STATE.failed = STATE.failed || [];
   STATE.recent = STATE.recent || [];
   STATE.waiting = STATE.waiting || [];
   STATE.active = STATE.active || [];
+  STATE.quality_choices = STATE.quality_choices || {max:"最高画质","1080":"1080P 及以下","720":"720P 及以下","480":"480P 及以下"};
+  STATE.total = STATE.total || 0;
+  STATE.today = STATE.today || 0;
+  STATE.bytes = STATE.bytes || 0;
+  STATE.uptime = STATE.uptime || 0;
+  STATE.max_speed = STATE.max_speed || 0;
+  STATE.out_dir = STATE.out_dir || "";
+  STATE.quality = STATE.quality || "max";
   const st = STATE.status || {};
   $("d-run").className = "dot " + (st.running ? "on" : "off");
   $("t-run").textContent = st.running ? "监听中" : "已停止";
@@ -533,7 +542,7 @@ function render(){
          <div class="t" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(f.title||f.id)}</div>
          <div class="meta">${esc(f.why||"未知原因")} · ${fmtTime(f.time)}</div>
        </div>
-       <button class="btn" onclick="retryDl('${esc(f.id)}')">重试</button>
+       <button class="btn" onclick="retryDl('${idq(f.id)}')">重试</button>
      </div>`).join("");
 
   // 近 14 天柱状图
@@ -661,6 +670,8 @@ function render(){
 
 // 近 14 天下载量柱状图(纯 CSS)
 function drawChart(recent){
+  // toggleChart() 展开时会无参调用, 这里回退到 STATE.recent 别把有数据的图表画空
+  if(!recent) recent = (STATE && STATE.recent) || [];
   const days = [];
   const now = new Date(); now.setHours(0,0,0,0);
   for(let i=13;i>=0;i--){
@@ -672,7 +683,8 @@ function drawChart(recent){
     if(d) d.n++;
   });
   const max = Math.max(1, ...days.map(d=>d.n));
-  $("chartWrap").style.display = "";
+  // 没有任何记录时保持 #chartWrap 隐藏, 别显示一个空图表
+  $("chartWrap").style.display = (recent && recent.length) ? "" : "none";
   $("chart").innerHTML = days.map(d=>{
     const h = Math.round(d.n/max*100);
     return `<div class="col" title="${new Date(d.t0*1000).getMonth()+1}/${new Date(d.t0*1000).getDate()}: ${d.n} 个">
@@ -808,19 +820,36 @@ function toggleDrawer(on){
   if(on) pullLog();   // 打开就立刻拉一次, 不用等 3 秒轮询
 }
 function toggleLog(on){
-  // 顶栏「查看日志」: 打开右侧日志抽屉
+  // 顶栏「设置 / 日志」: 打开右侧设置抽屉(运行日志在抽屉底部)
   toggleDrawer(!!on);
 }
 async function openWhat(what, id){
-  await api("/api/open", {what, id});
+  const j = await api("/api/open", {what, id});
+  if(!j.ok) toast(j.error || "操作失败");
 }
 function copyLink(id){
   const u = "https://www.douyin.com/video/" + id;
-  navigator.clipboard.writeText(u).then(()=>toast("已复制链接", u));
+  const done = ()=>toast("已复制链接", u);
+  const fail = ()=>toast("复制失败, 请手动复制", u);
+  // 非安全上下文/拒绝授权时 navigator.clipboard 可能不存在或 writeText 会 reject
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(u).then(done).catch(()=>{
+      // execCommand 回退: 老浏览器或 http 环境
+      const ta = document.createElement("textarea");
+      ta.value = u; ta.style.position = "fixed"; ta.style.opacity = "0";
+      document.body.appendChild(ta); ta.select();
+      let ok = false;
+      try{ ok = document.execCommand("copy"); }catch(_){}
+      ta.remove();
+      ok ? done() : fail();
+    });
+  } else {
+    fail();
+  }
 }
 async function setQuality(k){
   const j = await api("/api/settings", {quality:k});
-  if(!j.ok) return;
+  if(!j.ok){ toast(j.error || "操作失败"); return; }
   [...$("qualityRadios").children].forEach(l=>l.classList.toggle("on", l.dataset.k===k));
   toast("已切换画质", STATE.quality_choices[k]);
 }
@@ -830,8 +859,13 @@ async function saveOutdir(){
   const v = ($("outdirInput").value || "").trim();
   const j = await api("/api/settings", {out_dir: v});
   if(!j.ok){ toast("目录没保存", j.error || "目录建不出来或不可写"); return; }
+  // 用后端回传的 settings 当准: 清空(恢复默认)时 out_dir 会被删掉,
+  // 这时不能再拿改动前的 STATE.out_dir 提示旧目录, 直接按默认值提示
+  const saved = j.settings || {};
+  const dir = saved.out_dir || "downloads/";
+  if(STATE) STATE.out_dir = saved.out_dir ? dir : "";
   toast(v ? "下载目录已更新" : "已恢复默认目录",
-        "新下载的视频会存到: " + (STATE.out_dir || "downloads/"));
+        "新下载的视频会存到: " + dir);
 }
 
 // ---------- 快捷键与滚动 ----------
@@ -861,16 +895,34 @@ addEventListener("scroll", ()=>{
 }, {passive:true});
 
 // ---------- 实时连接 ----------
+// 重入保护: 网络抖动会连着触发 onerror, 别叠加多个 EventSource 和定时器
+let es = null, retryTimer = null, connecting = false;
 function connect(){
-  const es = new EventSource("/api/events");
-  es.onmessage = (e)=>{
+  if(connecting) return;
+  clearTimeout(retryTimer); retryTimer = null;
+  const oldEs = es;
+  if(oldEs) oldEs.close();
+  connecting = true;
+  const myEs = new EventSource("/api/events");
+  es = myEs;
+  myEs.onopen = ()=>{
+    if(es !== myEs) return;       // 旧连接的迟到回调, 别动新连接状态
+    connecting = false;
     $("conn").classList.remove("on");
-    try{ STATE = JSON.parse(e.data); render(); }catch(_){}
   };
-  es.onerror = ()=>{
+  myEs.onmessage = (e)=>{
+    if(es !== myEs) return;
+    $("conn").classList.remove("on");
+    try{ STATE = JSON.parse(e.data); render(); }
+    catch(err){ console.error(err); toast("状态解析失败", "后端数据异常, 已保留上一次画面"); }
+  };
+  myEs.onerror = ()=>{
+    if(es !== myEs) return;       // 已关闭的旧连接再报错, 忽略, 不重复排重连
+    connecting = false;
     $("conn").classList.add("on");
-    es.close();
-    setTimeout(connect, 1500);
+    myEs.close(); es = null;
+    clearTimeout(retryTimer);
+    retryTimer = setTimeout(connect, 1500);
   };
 }
 connect();

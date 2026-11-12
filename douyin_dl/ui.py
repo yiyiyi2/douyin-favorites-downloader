@@ -299,6 +299,81 @@ QUALITY_CHOICES = {
 # 设置
 # ---------------------------------------------------------------------------
 
+_SETTINGS_DEFAULTS = {
+    "quality": "max", "open_browser": True, "auto_reopen": True,
+    "by_author": False, "auto_rec": False, "auto_gap": 3.0,
+    "auto_adv": True,
+}
+
+# 设置文件读-改-写必须是原子的: 面板里快速连点两个开关, 两个 POST 各读各的
+# 再各写整份, 会互相覆盖; write_text 写到一半崩了还会留下半个坏 JSON
+# (正好触发 load_settings 的各种类型崩溃)。同一把锁 + 临时文件 os.replace。
+_settings_lock = threading.RLock()
+_settings_cache: dict[tuple, dict] = {}
+
+
+def _as_dict(v) -> dict:
+    """不是 dict 就当空 dict —— 防止畸形 JSON 让 .get/.items 抛 AttributeError。"""
+    return v if isinstance(v, dict) else {}
+
+
+def _as_number(v, default: float = 0.0) -> float:
+    """把任意值变成有限浮点数; 容器 / NaN / Inf / 非数字字符串一律回落 default。"""
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)):
+        f = float(v)
+    elif isinstance(v, str):
+        try:
+            f = float(v.strip())
+        except Exception:
+            return default
+    else:
+        return default
+    if f != f or f in (float("inf"), float("-inf")):
+        return default
+    return f
+
+
+def _as_bool(v, default: bool = False) -> bool:
+    """字符串 'false'/'0' 也算关, 'true'/'1' 算开; 其它类型回落 default。"""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "true", "yes", "on"):
+            return True
+        if s in ("0", "false", "no", "off", ""):
+            return False
+        return default
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return bool(v)
+    return default
+
+
+def _rel_path(workspace: Path, rel) -> Path | None:
+    """把 .state.json 里的 file 字段安全地变成 Path。
+
+    v1.6: 以前直接 `workspace / item["file"]`, file 变成 int/dict 就 TypeError,
+    相对路径 `../../etc/passwd` 还能被「打开/定位/删除」摸到工作区外面。
+    现在非字符串一律拒绝; 相对路径必须留在工作区内; 绝对路径(用户自定义
+    下载目录时 state 里存的就是绝对路径)放行。
+    """
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    try:
+        p = Path(rel)
+        if p.is_absolute():
+            return p
+        root = workspace.resolve()
+        full = (root / p).resolve()
+        if full == root or root in full.parents:
+            return full
+        return None
+    except Exception:
+        return None
+
+
 def _safe_id(v) -> str:
     """抖音的 aweme_id 只会是纯数字。thumb/delete/open 都会把它拼进文件路径,
     这里统一拦一下, 免得被 ../ 之类的东西穿越出去。"""
@@ -307,35 +382,83 @@ def _safe_id(v) -> str:
 
 
 def _clamp_gap(v) -> float:
-    """自动翻页间隔: 1~60 秒, 非法值回落到 3 秒。"""
+    """自动翻页间隔: 1~60 秒, 非法值/NaN/Inf 回落到 3 秒。"""
     try:
-        g = float(v)
+        g = _as_number(v, 3.0)
     except Exception:
-        return 3.0
-    if g != g:          # NaN
         return 3.0
     return max(1.0, min(60.0, g))
 
 
+def _clean_settings(data) -> dict:
+    """把落盘/前端传来的设置强制归一化, 保证每个字段都是能用的类型。
+
+    v1.6: 以前 `data.get("quality") not in QUALITY_CHOICES` 在 quality 是
+    list/dict 时抛 `TypeError: unhashable type`, 一个坏 settings 就能让
+    /api/state 与 /api/settings 全 500。这里所有字段都过一遍, 面板永远
+    拿得到一个可用快照。
+    """
+    d = dict(_SETTINGS_DEFAULTS)
+    d.update(_as_dict(data))
+    q = d.get("quality")
+    if not isinstance(q, str) or q not in QUALITY_CHOICES:
+        d["quality"] = "max"
+    for k in ("open_browser", "auto_reopen", "by_author", "auto_rec", "auto_adv"):
+        d[k] = _as_bool(d.get(k), bool(_SETTINGS_DEFAULTS[k]))
+    d["auto_gap"] = _clamp_gap(d.get("auto_gap"))
+    od = d.get("out_dir")
+    if od is not None and not isinstance(od, str):
+        od = None          # list/dict/int 都是坏值, 直接丢弃而不是 str() 出一串垃圾路径
+    if isinstance(od, str) and not od.strip():
+        od = None
+    if od is None:
+        d.pop("out_dir", None)
+    else:
+        d["out_dir"] = od.strip()
+    return d
+
+
 def load_settings(path: Path) -> dict:
-    data = {"quality": "max", "open_browser": True, "auto_reopen": True,
-            "by_author": False, "auto_rec": False, "auto_gap": 3.0,
-            "auto_adv": True}
+    """读设置。带一层以 (mtime, size) 为键的缓存: 面板每秒推很多次快照,
+    每次都重新读盘+解析 JSON 纯属浪费; 文件一变(面板保存/手工编辑)缓存自动失效。"""
     try:
-        if path.exists():
-            data.update(json.loads(path.read_text(encoding="utf-8")))
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
     except Exception:
-        pass
-    if data.get("quality") not in QUALITY_CHOICES:
-        data["quality"] = "max"
-    return data
+        key = (str(path), -1, -1)
+    with _settings_lock:
+        cached = _settings_cache.get(key)
+        if cached is not None:
+            return dict(cached)
+        data = dict(_SETTINGS_DEFAULTS)
+        try:
+            if path.exists():
+                data.update(_as_dict(json.loads(path.read_text(encoding="utf-8"))))
+        except Exception:
+            pass
+        clean = _clean_settings(data)
+        if len(_settings_cache) > 32:
+            _settings_cache.clear()
+        _settings_cache[key] = clean
+        return dict(clean)
 
 
 def save_settings(path: Path, data: dict):
-    try:
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+    """原子写: 同目录临时文件 -> os.replace, 不留半截坏 JSON。"""
+    clean = _clean_settings(data)
+    with _settings_lock:
+        _settings_cache.clear()
+        try:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(clean, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            os.replace(str(tmp), str(path))
+        except Exception:
+            try:
+                path.write_text(json.dumps(clean, ensure_ascii=False, indent=1),
+                                encoding="utf-8")
+            except Exception:
+                pass
 
 
 def filter_candidates(cands: list, pref: str) -> list:
@@ -374,6 +497,7 @@ class EventBus:
         self.on_auto_rec = None                     # callable(bool), 由主程序注入(实时切换 watcher.auto_recommend)
         self.on_auto_gap = None                     # callable(float), 由主程序注入(实时改自动翻页间隔)
         self.on_auto_adv = None                     # callable(bool), 由主程序注入(实时开关自动翻页)
+        self.on_out_dir = None                      # callable(Path), 由主程序注入(实时改下载目录全局)
         self.status = {"running": False, "browser": "", "note": ""}
         self.started = time.time()
         self.max_speed = 0.0
@@ -396,14 +520,21 @@ class EventBus:
     def publish(self):
         snap = self.snapshot()
         with self.lock:
-            dead = []
             for q in self.clients:
                 try:
                     q.put_nowait(snap)
                 except queue.Full:
-                    dead.append(q)
-            for q in dead:
-                self.clients.remove(q)
+                    # 旧行为: 队列满就把客户端移出 clients, 但 SSE 线程毫不知情,
+                    # 仍每 10s 发 ping -> 浏览器以为在线却永远收不到 data, 界面静默冻结。
+                    # 改成丢掉最旧一条, 保留订阅, 让慢客户端至少能收到最新快照。
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        q.put_nowait(snap)
+                    except queue.Full:
+                        pass
 
     # -- 写入 -------------------------------------------------------------
     def set_status(self, **kw):
@@ -417,6 +548,8 @@ class EventBus:
                 return
             self.waiting.append({"id": aid, "title": title, "author": author,
                                  "source": source, "at": int(time.time())})
+            if len(self.waiting) > 500:          # 长期挂机别让队列无限涨
+                del self.waiting[:-500]
         self.publish()
 
     def pop_waiting(self, aid: str | None = None):
@@ -495,19 +628,36 @@ class EventBus:
         self.publish()
 
     def retry(self, aid: str) -> bool:
-        """把失败的那条重新交给下载器; 返回是否成功入队。"""
+        """把失败的那条重新交给下载器。
+
+        v1.6: 改成后台线程受理。旧版同步等 on_retry(内部 refetch 最多 30 秒),
+        POST /api/retry 会把整个面板冻住, 用户以为没反应又连点好几下, 结果
+        重抓好几次、入队好几条。现在立即返回 True(已受理), 抓取结果由后台
+        线程回来后更新失败列表: 成功 -> 摘掉失败项(下载器内部已发 add_waiting
+        让它出现在队列里); 失败 -> 更新原因, 失败项还在, 可以再试。
+        """
         fn = self.on_retry
         if not fn:
             return False
-        try:
-            ok = fn(str(aid))
-        except Exception:
-            ok = False
-        if ok:
+        aid = str(aid)
+
+        def _work():
+            try:
+                ok = bool(fn(aid))
+            except Exception:
+                ok = False
             with self.lock:
-                self.failed.pop(str(aid), None)
+                if ok:
+                    self.failed.pop(aid, None)
+                else:
+                    rec = self.failed.get(aid)
+                    if isinstance(rec, dict):
+                        rec["why"] = (str(rec.get("why") or "") + " · 重试仍失败").strip(" ·")
+                        rec["time"] = int(time.time())
             self.publish()
-        return ok
+
+        threading.Thread(target=_work, name=f"dy-ui-retry-{aid[:12]}", daemon=True).start()
+        return True
 
     def set_speed(self, mbps: float):
         with self.lock:
@@ -516,51 +666,68 @@ class EventBus:
 
     # -- 读取 -------------------------------------------------------------
     def _recent(self) -> list[dict]:
-        """历史记录 = .state.json + downloads/_meta/*.json, 5 秒内不重复解析。"""
+        """历史记录 = .state.json + downloads/_meta/*.json, 5 秒内不重复解析。
+
+        v1.6: .state.json 是落盘文件, 可能被旧版写成别的形状 / 被手工编辑 /
+        写到一半断电。以前 json.loads 之外的访问全裸奔, 一个坏值就让
+        /api/state 与所有 SSE 推送一起 500。现在每一行都做类型归一, 坏行跳过,
+        整段再兜一层, 保证面板永远能出得来。
+        """
         now = time.time()
         if self._recent_cache is not None and now - self._recent_stamp < 5:
             return self._recent_cache
         out: list[dict] = []
         try:
             state = json.loads(self.state_file.read_text(encoding="utf-8")) if self.state_file.exists() else {}
+            if not isinstance(state, dict):
+                state = {}
+            meta_dir = self.out_dir / "_meta"
+            meta_dir_default = self.workspace / "downloads" / "_meta"   # 改过下载目录后老元数据还在默认位置
+            for aid, row in state.items():
+                if not isinstance(row, dict):
+                    row = {}
+                f = _rel_path(self.workspace, row.get("file"))
+                tm = _as_number(row.get("time", 0), 0.0)
+                item = {
+                    "id": str(aid),
+                    "file": row.get("file") if isinstance(row.get("file"), str) else "",
+                    "quality": row.get("quality") if isinstance(row.get("quality"), str) else "",
+                    "time": tm,
+                    "title": "",
+                    "author": "",
+                    "cover": "",
+                    "size": 0,
+                    "type": "video",
+                }
+                if f and f.exists():
+                    try:
+                        item["size"] = f.stat().st_size if f.is_file() else 0
+                    except Exception:
+                        pass
+                    if f.is_dir():
+                        item["type"] = "images"
+                safe = _safe_id(aid)
+                for md in (meta_dir, meta_dir_default):
+                    if not safe:
+                        break
+                    try:
+                        mp = md / f"{safe}.json"
+                        if not mp.exists():
+                            continue
+                        m = json.loads(mp.read_text(encoding="utf-8"))
+                        if not isinstance(m, dict):
+                            continue
+                        item["title"] = m.get("desc", "") if isinstance(m.get("desc"), str) else ""
+                        item["author"] = m.get("author", "") if isinstance(m.get("author"), str) else ""
+                        item["cover"] = m.get("cover", "") if isinstance(m.get("cover"), str) else ""
+                        item["duration"] = _as_number(m.get("duration_ms", 0), 0)
+                        item["music"] = m.get("music", "") if isinstance(m.get("music"), str) else ""
+                        break
+                    except Exception:
+                        continue
+                out.append(item)
         except Exception:
-            state = {}
-        meta_dir = self.out_dir / "_meta"
-        meta_dir_default = self.workspace / "downloads" / "_meta"   # 改过下载目录后老元数据还在默认位置
-        for aid, row in state.items():
-            item = {
-                "id": aid,
-                "file": row.get("file", ""),
-                "quality": row.get("quality", ""),
-                "time": row.get("time", 0),
-                "title": "",
-                "author": "",
-                "cover": "",
-                "size": 0,
-                "type": "video",
-            }
-            f = self.workspace / item["file"] if item["file"] else None
-            if f and f.exists():
-                try:
-                    item["size"] = f.stat().st_size if f.is_file() else 0
-                except Exception:
-                    pass
-                if f.is_dir():
-                    item["type"] = "images"
-            mp = meta_dir / f"{aid}.json"
-            if not mp.exists():
-                mp = meta_dir_default / f"{aid}.json"
-            if mp.exists():
-                try:
-                    m = json.loads(mp.read_text(encoding="utf-8"))
-                    item["title"] = m.get("desc", "")
-                    item["author"] = m.get("author", "")
-                    item["cover"] = m.get("cover", "")
-                    item["duration"] = m.get("duration_ms", 0)
-                    item["music"] = m.get("music", "")
-                except Exception:
-                    pass
-            out.append(item)
+            out = []
         out.sort(key=lambda x: x.get("time") or 0, reverse=True)
         self._recent_cache = out
         self._recent_stamp = now
@@ -591,8 +758,8 @@ class EventBus:
             "failed": failed,
             "recent": recent[:300],
             "total": len(recent),
-            "today": sum(1 for x in recent if (x.get("time") or 0) >= today0),
-            "bytes": sum(x.get("size") or 0 for x in recent),
+            "today": sum(1 for x in recent if _as_number(x.get("time"), 0.0) >= today0),
+            "bytes": sum(_as_number(x.get("size"), 0.0) for x in recent),
             "max_speed": self.max_speed,
             "quality": conf.get("quality") or "max",
             "quality_choices": QUALITY_CHOICES,
@@ -681,6 +848,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- GET --------------------------------------------------------------
     def do_GET(self):  # noqa: N802
+        try:
+            self._route_get()
+        except Exception as e:
+            try:
+                self._json({"error": f"请求处理失败: {e}"}, 500)
+            except Exception:
+                pass
+
+    def _route_get(self):
         u = urlparse(self.path)
         path = u.path
         qs = parse_qs(u.query)
@@ -777,124 +953,175 @@ class _Handler(BaseHTTPRequestHandler):
 
     # -- POST -------------------------------------------------------------
     def do_POST(self):  # noqa: N802
-        u = urlparse(self.path)
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b"{}"
         try:
-            body = json.loads(raw.decode("utf-8") or "{}")
+            u = urlparse(self.path)
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                length = 0
+            # v1.6: 不设上限的话, 一个 `Content-Length: 999999999999` 就能
+            # 让 rfile.read 吃光内存 / 挂住这个请求线程; 负数会读到连接关闭。
+            if length < 0 or length > (1 << 20):
+                self._json({"ok": False, "error": "请求体太大或长度非法"}, 400)
+                return
+            raw = self.rfile.read(length) if length else b"{}"
+            try:
+                body = json.loads(raw.decode("utf-8") or "{}")
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            try:
+                self._route_post(u.path, body)
+            except Exception as e:
+                # v1.6: 结构错的 body / 坏 URL / 任何 handler 异常都必须给客户端一个
+                # 明确响应, 不能让连接被重置, 也不能让 ThreadingHTTPServer 吞掉堆栈。
+                try:
+                    self._json({"ok": False, "error": f"请求处理失败: {e}"}, 500)
+                except Exception:
+                    pass
         except Exception:
-            body = {}
+            # 连 urlparse 都可能抛(畸形 IPv6 URL), 兜到底
+            try:
+                self._json({"ok": False, "error": "请求无效"}, 400)
+            except Exception:
+                pass
 
-        if u.path == "/api/open":
+    def _route_post(self, path: str, body: dict):
+        if path == "/api/open":
             self._json({"ok": self._open(body)})
             return
 
-        if u.path == "/api/settings":
-            path = self.bus.workspace / ".settings.json"
-            cur = load_settings(path)
-            if body.get("quality") in QUALITY_CHOICES:
-                cur["quality"] = body["quality"]
-            if isinstance(body.get("by_author"), bool):
-                cur["by_author"] = body["by_author"]
-            if isinstance(body.get("auto_reopen"), bool):
-                cur["auto_reopen"] = body["auto_reopen"]
-            # v1.4: 自动下推荐页开关。保存时立即同步给 watcher, 不重启就生效。
-            if isinstance(body.get("auto_rec"), bool):
-                cur["auto_rec"] = body["auto_rec"]
-                cb = getattr(self.bus, "on_auto_rec", None)
-                if callable(cb):
-                    try:
-                        cb(body["auto_rec"])
-                    except Exception:
-                        pass
-            # v1.5: 自动翻页间隔(秒)。1~60 之外一律夹回去, 避免 0 秒疯狂翻页把页面刷崩。
-            if "auto_gap" in body:
-                try:
+        if path == "/api/settings":
+            settings_path = self.bus.workspace / ".settings.json"
+            with _settings_lock:
+                cur = load_settings(settings_path)
+                q = body.get("quality")
+                if isinstance(q, str) and q in QUALITY_CHOICES:
+                    cur["quality"] = q
+                if isinstance(body.get("by_author"), bool):
+                    cur["by_author"] = body["by_author"]
+                if isinstance(body.get("auto_reopen"), bool):
+                    cur["auto_reopen"] = body["auto_reopen"]
+                # v1.4: 自动下推荐页开关。保存时立即同步给 watcher, 不重启就生效。
+                if isinstance(body.get("auto_rec"), bool):
+                    cur["auto_rec"] = body["auto_rec"]
+                    cb = getattr(self.bus, "on_auto_rec", None)
+                    if callable(cb):
+                        try:
+                            cb(body["auto_rec"])
+                        except Exception:
+                            pass
+                # v1.5: 自动翻页间隔(秒)。1~60 之外一律夹回去, 避免 0 秒疯狂翻页把页面刷崩。
+                if "auto_gap" in body:
                     g = _clamp_gap(body.get("auto_gap"))
-                except Exception:
-                    g = 3.0
-                cur["auto_gap"] = g
-                cb = getattr(self.bus, "on_auto_gap", None)
-                if callable(cb):
-                    try:
-                        cb(g)
-                    except Exception:
-                        pass
-            # v1.5: 自动翻页开关(自动下推荐页开着时才有效)
-            if isinstance(body.get("auto_adv"), bool):
-                cur["auto_adv"] = body["auto_adv"]
-                cb = getattr(self.bus, "on_auto_adv", None)
-                if callable(cb):
-                    try:
-                        cb(body["auto_adv"])
-                    except Exception:
-                        pass
-            # 下载目录可调: 必须是绝对路径; 相对路径按工作区补全后存。
-            # 建不出来(盘不存在/没权限)就拒绝, 不留下一个下载会悄悄失败的设置。
-            if "out_dir" in body:
-                raw = str(body.get("out_dir") or "").strip()
-                if raw:
-                    p = Path(raw).expanduser()
-                    if not p.is_absolute():
-                        p = (self.bus.workspace / p).resolve()
-                    try:
-                        p.mkdir(parents=True, exist_ok=True)
-                        test = p / ".dy_write_test"
-                        test.write_text("x", encoding="utf-8")
-                        test.unlink()
-                    except Exception:
-                        self._json({"ok": False, "error": "目录建不出来或不可写, 没有保存"})
-                        return
-                    cur["out_dir"] = str(p)
-                    self.bus.out_dir = p          # 面板的「打开文件夹」等立即跟随
-                    try:
-                        (p / "_meta").mkdir(exist_ok=True)
-                    except Exception:
-                        pass
-                else:
-                    # 清空 = 恢复默认 downloads/
-                    cur.pop("out_dir", None)
-                    self.bus.out_dir = self.bus.workspace / "downloads"
-            save_settings(path, cur)
+                    cur["auto_gap"] = g
+                    cb = getattr(self.bus, "on_auto_gap", None)
+                    if callable(cb):
+                        try:
+                            cb(g)
+                        except Exception:
+                            pass
+                # v1.5: 自动翻页开关(自动下推荐页开着时才有效)
+                if isinstance(body.get("auto_adv"), bool):
+                    cur["auto_adv"] = body["auto_adv"]
+                    cb = getattr(self.bus, "on_auto_adv", None)
+                    if callable(cb):
+                        try:
+                            cb(body["auto_adv"])
+                        except Exception:
+                            pass
+                # 下载目录可调: 必须是字符串; 相对路径按工作区补全后存。
+                # 建不出来(盘不存在/没权限)就拒绝, 不留下一个下载会悄悄失败的设置。
+                if "out_dir" in body:
+                    od = body.get("out_dir")
+                    raw = od.strip() if isinstance(od, str) else ""
+                    if raw:
+                        p = Path(raw).expanduser()
+                        if not p.is_absolute():
+                            p = (self.bus.workspace / p).resolve()
+                        try:
+                            p.mkdir(parents=True, exist_ok=True)
+                            test = p / ".dy_write_test"
+                            test.write_text("x", encoding="utf-8")
+                            test.unlink()
+                        except Exception:
+                            self._json({"ok": False, "error": "目录建不出来或不可写, 没有保存"})
+                            return
+                        cur["out_dir"] = str(p)
+                        self.bus.out_dir = p          # 面板的「打开文件夹」等立即跟随
+                        try:
+                            (p / "_meta").mkdir(exist_ok=True)
+                        except Exception:
+                            pass
+                    else:
+                        # 清空 = 恢复默认 downloads/
+                        cur.pop("out_dir", None)
+                        self.bus.out_dir = self.bus.workspace / "downloads"
+                    cb = getattr(self.bus, "on_out_dir", None)
+                    if callable(cb):
+                        try:
+                            cb(self.bus.out_dir)
+                        except Exception:
+                            pass
+                save_settings(settings_path, cur)
             self.bus.publish()
             self._json({"ok": True, "settings": cur})
             return
 
-        if u.path == "/api/retry":
+        if path == "/api/retry":
             ok = self.bus.retry(_safe_id(body.get("id")))
             self._json({"ok": ok})
             return
 
-        if u.path == "/api/delete":
+        if path == "/api/delete":
             self._json({"ok": self._delete(body)})
             return
 
         self._json({"error": "not found"}, 404)
 
     def _delete(self, body: dict) -> bool:
-        """从面板删掉一条记录: 删 mp4/图文文件 + _meta + .state.json 条目 + 缩略图。"""
+        """从面板删掉一条记录: 删 mp4/图文文件 + _meta + .state.json 条目 + 缩略图。
+
+        v1.6: 返回值只取决于「state 里还有没有这条」, 文件已经不在也照样算删掉,
+        重复点删除不会弹「删除失败」。
+        """
         aid = _safe_id(body.get("id"))
         if not aid:
             return False
-        removed = False
         try:
             for x in self.bus._recent():
                 if x.get("id") != aid:
                     continue
-                f = x.get("file")
-                if f:
-                    t = self.bus.workspace / f
-                    if t.is_file():
-                        t.unlink(); removed = True
-                    elif t.is_dir():
+                f = _rel_path(self.bus.workspace, x.get("file"))
+                if f and f.is_file():
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+                elif f and f.is_dir():
+                    try:
                         import shutil
-                        shutil.rmtree(t, ignore_errors=True)
-                        removed = True
-                    # _meta 跟文件放在一起(开了按作者分文件夹就是 downloads/作者/_meta/)
-                    d = t.parent / "_meta" / f"{aid}.json"
-                    if d.is_file():
-                        d.unlink()
-                removed = True
+                        shutil.rmtree(f, ignore_errors=True)
+                    except Exception:
+                        pass
+                # meta 写在下载根 _meta/ (main 的 _save_meta), 不是文件旁边;
+                # 按作者分文件夹时两者不在同一目录, 所以两个位置都找一遍。
+                for md in (self.bus.out_dir / "_meta",
+                           self.bus.workspace / "downloads" / "_meta"):
+                    try:
+                        mp = md / f"{aid}.json"
+                        if mp.is_file():
+                            mp.unlink()
+                    except Exception:
+                        pass
+                    try:
+                        if f:
+                            mp2 = f.parent / "_meta" / f"{aid}.json"
+                            if mp2.is_file():
+                                mp2.unlink()
+                    except Exception:
+                        pass
             # 记录一定要交给主程序删: 下载线程持有 State 的内存副本并整个重写文件,
             # 面板这边直接改 .state.json 会被它下一次 mark() 覆盖回去(删掉的记录复活)
             if callable(self.bus.on_delete):
@@ -905,18 +1132,24 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 st = self.bus.state_file
                 if st.exists():
-                    data = json.loads(st.read_text(encoding="utf-8"))
-                    if aid in data:
-                        data.pop(aid, None)
-                        st.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    try:
+                        data = json.loads(st.read_text(encoding="utf-8"))
+                        if isinstance(data, dict) and aid in data:
+                            data.pop(aid, None)
+                            st.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+                    except Exception:
+                        pass
             th = self.bus.thumbs_dir / f"{aid}.jpg"
             if th.exists():
-                th.unlink()
+                try:
+                    th.unlink()
+                except Exception:
+                    pass
             self.bus._recent_cache = None
             self.bus.publish()
         except Exception:
-            return removed
-        return removed
+            pass
+        return True
 
     def _open(self, body: dict) -> bool:
         what = body.get("what")
@@ -927,8 +1160,10 @@ class _Handler(BaseHTTPRequestHandler):
             if what == "file":
                 aid = _safe_id(body.get("id"))
                 for x in self.bus._recent():
-                    if x["id"] == aid and x.get("file"):
-                        target = self.bus.workspace / x["file"]
+                    if x["id"] == aid:
+                        target = _rel_path(self.bus.workspace, x.get("file"))
+                        if not target or not target.exists():
+                            continue
                         if target.is_dir():
                             os.startfile(str(target))         # noqa: S606 图文作品是目录, 只能开目录
                         else:
@@ -946,8 +1181,10 @@ class _Handler(BaseHTTPRequestHandler):
             if what == "reveal":
                 aid = _safe_id(body.get("id"))
                 for x in self.bus._recent():
-                    if x["id"] == aid and x.get("file"):
-                        target = self.bus.workspace / x["file"]
+                    if x["id"] == aid:
+                        target = _rel_path(self.bus.workspace, x.get("file"))
+                        if not target or not target.exists():
+                            continue
                         if target.is_file():
                             subprocess.Popen(["explorer", "/select,", str(target)])
                         else:
@@ -965,35 +1202,65 @@ def start_ui(bus: EventBus, web_file: Path, port: int = 8899,
              open_browser: bool = True, log=print) -> str:
     """起面板服务, 返回访问地址。
 
-    严格单实例: 8899 已被占用说明面板已经在跑(守护重启/双击 bat 都会遇到),
-    这时不再起新面板也不弹浏览器, 直接返回空 —— 用户浏览器里那个标签页还活着,
-    SSE 会自动重连到新进程。"""
+    v1.6: 旧行为是探测到 8899 已有面板就 `return ""`, 本进程继续下载却不
+    起服务 —— 一旦那个实例退出, 端口上就再没有面板, 用户标签页永远断线,
+    而且注释里那句「SSE 会自动重连到新进程」根本不成立(新进程没服务)。
+    现在改成看门狗: 端口被占时先盯着, 一空出来就由本进程把服务补上。
+    """
     _Handler.bus = bus
     _Handler.web_file = web_file
-    # 先探测是不是已有面板在跑
-    try:
-        import urllib.request as _ur
-        with _ur.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=2) as r:
-            if r.status == 200:
-                log(f"  面板已在运行: http://127.0.0.1:{port}/ (不重复打开)")
-                return ""
-    except Exception:
-        pass
-    try:
-        server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
-    except OSError as e:
-        # 8899 被别的程序占了(不是我们的面板): 不顺延端口, 避免开出多个面板
-        log(f"  ! 面板端口 {port} 被其他程序占用, 本次不启动面板: {e}")
-        return ""
-
-    threading.Thread(target=server.serve_forever, daemon=True, name="dy-ui").start()
     url = f"http://127.0.0.1:{port}/"
+
+    def _probe_state() -> bool:
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(url + "api/state", timeout=2) as r:
+                return r.status == 200
+        except Exception:
+            return False
+
+    def _bind():
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+        except OSError:
+            return None
+
+    def _serve(server):
+        threading.Thread(target=server.serve_forever, daemon=True,
+                         name="dy-ui").start()
+
+    def _open_browser():
+        time.sleep(0.8)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    def _watchdog(reason: str):
+        log(f"  {reason}; 端口空出后本进程会自动接管面板")
+        while True:
+            time.sleep(2)
+            if _probe_state():
+                continue                      # 对方面板还活着, 继续等
+            s = _bind()
+            if s is not None:
+                log(f"  已接管面板: {url}")
+                _serve(s)
+                return
+            # 绑不上(别的非面板程序占着/ TIME_WAIT), 下一轮再试
+
+    if _probe_state():
+        threading.Thread(target=_watchdog, name="dy-ui-watch", daemon=True,
+                         args=(f"面板已在运行: {url} (不重复打开)",)).start()
+        return url
+
+    server = _bind()
+    if server is None:
+        threading.Thread(target=_watchdog, name="dy-ui-watch", daemon=True,
+                         args=(f"! 面板端口 {port} 被其他程序占用",)).start()
+        return url
+
+    _serve(server)
     if open_browser:
-        def _open():
-            time.sleep(0.8)
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-        threading.Thread(target=_open, daemon=True).start()
+        threading.Thread(target=_open_browser, daemon=True).start()
     return url

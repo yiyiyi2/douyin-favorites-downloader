@@ -1,8 +1,8 @@
-# 抖音收藏自动下载 · v1.5
+# 抖音收藏自动下载 · v1.6
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-1.5-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-1.6-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -77,7 +77,15 @@ python douyin_dl/daemon.py
 ```
 
 双击 `启动收藏下载.bat` 走的就是这条路：守护进程 + 主程序都在后台，面板自动弹出。
-想彻底停掉：`taskkill /f /im pythonw.exe`。
+想彻底停掉：用任务管理器结束 `douyin_dl.py` / `daemon.py` 对应的 `pythonw.exe` 进程；或按命令行精确筛出本工具的进程再结束（PowerShell）：
+
+```powershell
+Get-CimInstance Win32_Process -Filter "name='pythonw.exe'" |
+  Where-Object { $_.CommandLine -like '*douyin_dl.py*' -or $_.CommandLine -like '*daemon.py*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+```
+
+**别图省事按进程名 `pythonw.exe` 一刀切全杀** —— 那种写法会把系统里**所有** `pythonw.exe` 进程一起结束，包括其它软件、其它 Python 脚本起的后台进程，不只本工具。上面按命令行筛一遍，才只动本工具自己的进程。
 连续 5 次启动即秒退时守护会放弃，避免无限重启。
 
 # 画质
@@ -156,6 +164,26 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v1.6
+
+**主题：更耐用 —— 抖音/浏览器/环境怎么变，都尽量还能用；顺手修掉一批大小 bug。**
+
+- **抖音接口字段再变也不怕**：视频 id 认 `aweme_id`/`awemeId`/`itemId`/`object_id` 等别名，
+  收藏动作认 `1`/`0`/`true`/`collect`/`favorite`/`cancel` 等形态， aweme 被多包一层、
+  或整段是 JSON 字符串也照样挖得出来；不再写死某个字段名/长度，接口小改不至于整条链失效
+- **抓取钩子更稳**：等请求体+响应体都到齐再上报（修异步竞态导致的偶发漏收藏），
+  响应超过 32MB 直接丢弃而不是截成无效 JSON，Chrome 找不到时会自动找 Edge、翻注册表和 PATH
+- **登录判定更准**：只认真正登录才会有的 Cookie（`sessionid`/`sid_guard`/`uid_tt` 等），
+  游客态的 `ttwid`/`msToken` 不再被误当登录，避免"明明没登录却一直不提示、全是 403"
+- **坏数据不崩**：状态文件/设置文件/网络响应被写坏、被手工改坏、或半截断电，
+  一律按类型归一化兜底，不会让面板白屏、下载线程崩掉或统计错乱；设置改原子写，不留半截坏文件
+- **改目录立即生效**：面板里切换下载目录，正在跑的下载线程马上跟过去，不用重启
+- **重试不卡面板**：点重试改成后台处理，面板不再冻住几十秒，也不会因为连点重复抓
+- **长跑更省心**：待办/已见集合设上限防内存膨胀；面板断线能自动补服务；
+  浏览器/登录失败给出明确退出码，守护进程不再把故障当"正常退出"反复重启
+- **失败出口更明确**：`--check` 提前到起面板/抢锁之前，检查登录不会留下残留锁文件
+- 回归测试从 43 个扩到 119 个，新增的畸形输入用例还揪出一个"列表被当成视频 id"的隐藏 bug
 
 ## v1.5
 
