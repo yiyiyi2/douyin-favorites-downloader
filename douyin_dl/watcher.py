@@ -842,6 +842,50 @@ class BrowserWatcher:
                 self.log(f"  · 新收藏 {aid}, 正在抓取最新视频信息…")
 
     # -- 补全: 用无头浏览器取详情 -------------------------------------------
+    @staticmethod
+    def _launch_headless(pw):
+        """起一个无头 Chromium, 自动适配本机装了哪种浏览器。
+
+        教训(v1.6.1): 之前写死不指定 channel, 以为"Playwright 自带 chromium
+        已随 pip 装好"——错的, pip 只装了驱动库, 浏览器二进制要额外
+        `playwright install` 才会下载, 没装的话每次都抛 "Executable
+        doesn't exist", 所有收藏补全都拿不到详情, 一个都下不了。
+        现在按"最可能成功"的顺序逐个尝试, 哪个能起用哪个:
+          1. find_chrome() 找到的系统 Chrome/Edge(executable_path)
+          2. channel="chrome"(系统标准安装的 Chrome)
+          3. channel="msedge"(只有 Edge 的机器)
+          4. Playwright 自带 chromium(用户跑过 playwright install 的情况)
+        全失败才把最后一个异常抛给调用方记日志。
+        """
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--mute-audio",
+            "--disable-gpu",
+            "--no-first-run",
+        ]
+        attempts: list[tuple[str, dict]] = []
+        try:
+            exe = find_chrome()
+        except Exception:
+            exe = None
+        if exe:
+            attempts.append((f"系统浏览器({Path(exe).name})", {"executable_path": exe}))
+        attempts.append(('channel="chrome"', {"channel": "chrome"}))
+        attempts.append(('channel="msedge"', {"channel": "msedge"}))
+        attempts.append(("Playwright 自带 chromium", {}))
+        last_err: Exception | None = None
+        for label, kw in attempts:
+            try:
+                b = pw.chromium.launch(headless=True, args=args, **kw)
+                return b
+            except Exception as e:
+                last_err = e
+                continue
+        raise RuntimeError(
+            "无头浏览器起不来(系统 Chrome/Edge 与自带 chromium 都不可用): "
+            + (str(last_err)[:160] if last_err else "未知原因")
+        )
+
     def _hl_loop(self):
         """
         后台线程: 用一个无头 Chrome 打开视频页, 抓页面自己发出的详情接口。
@@ -856,18 +900,7 @@ class BrowserWatcher:
         inflight: str | None = None
         try:
             with sync_playwright() as pw:
-                browser = pw.chromium.launch(
-                    headless=True,
-                    # v1.6: find_chrome() 可能返回 Edge, 写死 channel="chrome" 会启动失败。
-                    # 不指定 channel 就用 Playwright 自带的 chromium(已随 pip 装好),
-                    # 跨平台最稳; 想用系统 Chrome 时由 executable_path 兜底更可靠。
-                    args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--mute-audio",
-                        "--disable-gpu",
-                        "--no-first-run",
-                    ],
-                )
+                browser = self._launch_headless(pw)
                 ctx = browser.new_context(
                     user_agent=UA,
                     viewport={"width": 1280, "height": 800},

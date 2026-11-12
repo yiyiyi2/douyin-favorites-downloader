@@ -315,3 +315,57 @@ def test_get_out_dir_follows_settings(tmp_path, monkeypatch):
     d.save_settings_file(d.SETTINGS_FILE, {"out_dir": str(custom)})
     assert d.get_out_dir() == custom
     assert custom.exists()   # 顺手建出来了
+
+
+# ---------------------------------------------------------------------------
+# 5. 无头浏览器回退链(v1.6.1 回归: 曾因只用自带 chromium 导致全部收藏下不了)
+# ---------------------------------------------------------------------------
+class _FakeChromium:
+    """假 playwright.chromium: 记录每次 launch 参数, 按脚本决定成功/失败。"""
+
+    def __init__(self, fail_on):
+        self.fail_on = set(fail_on)      # 第几次尝试失败(0-based)
+        self.calls = []
+
+    def launch(self, **kw):
+        i = len(self.calls)
+        self.calls.append(kw)
+        if i in self.fail_on:
+            raise RuntimeError(f"launch attempt {i} failed")
+        return f"browser-{i}"
+
+
+class _FakePW:
+    def __init__(self, fail_on):
+        self.chromium = _FakeChromium(fail_on)
+
+
+def test_launch_headless_falls_back_when_first_choice_fails(monkeypatch):
+    """首选(系统 Chrome)失败时, 必须继续试 channel=chrome/msedge/自带, 不能一次失败就放弃。"""
+    # 让 find_chrome 返回一个确定路径, 保证第一路是 executable_path
+    monkeypatch.setattr("douyin_dl.watcher.find_chrome", lambda: r"C:\fake\chrome.exe")
+    # 让第 0 次(系统浏览器)和第 1 次(channel=chrome)都失败, 第 2 次成功
+    pw = _FakePW(fail_on={0, 1})
+    got = BrowserWatcher._launch_headless(pw)
+    assert got == "browser-2"
+    assert len(pw.chromium.calls) >= 3          # 确实试了多次
+    assert "executable_path" in pw.chromium.calls[0]
+    assert pw.chromium.calls[1].get("channel") == "chrome"
+    assert pw.chromium.calls[2].get("channel") == "msedge"
+
+
+def test_launch_headless_all_fail_raises_clear_error(monkeypatch):
+    """所有方式都起不来时, 抛清晰异常而不是静默返回 None(否则主循环白等)。"""
+    monkeypatch.setattr("douyin_dl.watcher.find_chrome", lambda: None)
+    pw = _FakePW(fail_on={0, 1, 2})
+    with pytest.raises(RuntimeError, match="无头浏览器起不来"):
+        BrowserWatcher._launch_headless(pw)
+
+
+def test_launch_headless_uses_system_chrome_first(monkeypatch):
+    """find_chrome 找到系统浏览器时, 第一顺位必须是它(本机实测可用)。"""
+    monkeypatch.setattr("douyin_dl.watcher.find_chrome", lambda: r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    pw = _FakePW(fail_on=set())
+    got = BrowserWatcher._launch_headless(pw)
+    assert got == "browser-0"                   # 第一路就成了
+    assert pw.chromium.calls[0]["executable_path"].endswith("chrome.exe")
