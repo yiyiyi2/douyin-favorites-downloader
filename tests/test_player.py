@@ -173,6 +173,43 @@ def test_player_rail_does_not_double_offset_for_grid():
         assert m and "--goff" in m.group(0), f"{sel} 应该继续用 --goff 给网格让位"
 
 
+def test_player_has_like_and_fav_filters():
+    """v2.4 回归: 网格要能按「已赞 / 已藏 / 已关注」筛选。
+
+    这两行是正交维度: 平台(抖音/快手/B站) + 标记(赞/藏/关注) 必须能同时生效,
+    所以标记筛选不能塞进 #gChips, 要单独一组 #gFlags。
+    """
+    t = _player_src()
+    assert 'id="gFlags"' in t, "缺标记筛选容器 #gFlags"
+    for f in ("like", "fav", "follow"):
+        assert f'data-f="{f}"' in t, f"缺标记筛选项 {f}"
+    assert 'data-f="all"' in t
+    # 三个计数位
+    for cid in ("cnLike", "cnFav", "cnFollow"):
+        assert f'id="{cid}"' in t, f"缺计数位 {cid}"
+    # 平台筛选必须还留着(两行互不影响)
+    for f in ("douyin", "kuaishou", "bilibili"):
+        assert f'data-p="{f}"' in t
+    # buildGrid 里必须真的按标记过滤
+    body = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+    for cond in ("flag === 'like'   && !LIKE[it.id]",
+                 "flag === 'fav'    && !FAV[it.id]",
+                 "flag === 'follow' && !FOLLOW[it.author"):
+        assert cond in body, f"buildGrid 缺过滤条件: {cond}"
+    # 两个维度都不为 all 时才都生效(AND 语义)
+    assert "plat !== 'all' && platLabel(it) !== plat" in body
+
+
+def test_player_flags_rebuild_on_mark_change():
+    """在「已赞」筛选下点赞/取消赞, 网格要立刻变, 不能等手动刷新。"""
+    t = _player_src()
+    body = re.sub(r"/\*.*?\*/", "", t, flags=re.S)
+    assert "function flagActive()" in body
+    # like / fav / follow 三个分支都要在标记变化后重建网格
+    assert body.count("if (flagActive()) buildGrid(); else refreshFlagCounts();") >= 3, (
+        "点赞/收藏/关注改完后都要重建网格(否则筛选结果不动)")
+
+
 def test_player_card_overlay_ignores_pointer():
     """卡片上的角标/文案必须 pointer-events:none, 否则点击被它们截走。"""
     t = _player_src()

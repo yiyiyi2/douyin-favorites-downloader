@@ -182,6 +182,12 @@
     color:var(--dim);transition:.15s;
   }
   #grid .chip.on{background:#fff;color:#000;font-weight:600}
+  /* 第二行是"标记"维度, 和平台维度正交(可同时生效) */
+  #grid .flags{margin-top:5px;padding-top:6px;border-top:1px solid var(--line)}
+  #grid .chip.flag.on{background:var(--pink);color:#fff}
+  #grid .chip.flag[data-f="fav"].on{background:#ffc53d;color:#000}
+  #grid .chip.flag[data-f="follow"].on{background:var(--cyan);color:#000}
+  #grid .chip .cn{font-size:10px;opacity:.72;font-variant-numeric:tabular-nums}
   #grid .gbody{
     flex:1;overflow-y:auto;overflow-x:hidden;padding:9px;
     display:grid;grid-template-columns:repeat(3,1fr);gap:7px;align-content:start;
@@ -386,6 +392,12 @@
       <button class="chip" data-p="douyin">抖音</button>
       <button class="chip" data-p="kuaishou">快手</button>
       <button class="chip" data-p="bilibili">B站</button>
+    </div>
+    <div class="chips flags" id="gFlags">
+      <button class="chip flag on" data-f="all">全部</button>
+      <button class="chip flag" data-f="like">👍 已赞 <span class="cn" id="cnLike">0</span></button>
+      <button class="chip flag" data-f="fav">⭐ 已藏 <span class="cn" id="cnFav">0</span></button>
+      <button class="chip flag" data-f="follow">👤 已关注 <span class="cn" id="cnFollow">0</span></button>
     </div>
   </div>
   <div class="gbody" id="gBody"></div>
@@ -785,6 +797,8 @@ function act(name) {
     // 网格角标刷新
     const c = gBody.querySelector(`.card[data-id="${CSS.escape(it.id)}"] .likedot`);
     if (c) c.style.display = on ? 'block' : 'none';
+    // 正开着标记筛选时, 取消/加上赞要立刻反映到网格里
+    if (flagActive()) buildGrid(); else refreshFlagCounts();
   } else if (name === 'fav') {
     const on = !FAV[it.id];
     if (on) FAV[it.id] = 1; else delete FAV[it.id];
@@ -793,6 +807,7 @@ function act(name) {
     b.classList.toggle('on', on);
     b.querySelector('.n').textContent = on ? '已藏' : '收藏';
     toast(on ? '已收藏到本地（只存本机）' : '取消收藏');
+    if (flagActive()) buildGrid(); else refreshFlagCounts();
   } else if (name === 'cmt') {
     openCmt();
   } else if (name === 'share') {
@@ -819,6 +834,7 @@ function act(name) {
       b.textContent = on ? '已关注' : '关注';
     });
     toast(on ? ('已关注 @' + a) : ('已取消关注 @' + a));
+    if (flagActive()) buildGrid(); else refreshFlagCounts();
   }
 }
 
@@ -888,10 +904,14 @@ function buildGrid() {
   const q = ($('#gSearch').value || '').trim().toLowerCase();
   const plat = ($('#gChips .chip.on') || {}).dataset ?
     ($('#gChips .chip.on').dataset.p || 'all') : 'all';
+  const flag = ($('#gFlags .chip.on') || {}).dataset ?
+    ($('#gFlags .chip.on').dataset.f || 'all') : 'all';
   VIEW = ITEMS.filter((it) => {
-    if (plat !== 'all') {
-      if (platLabel(it) !== plat) return false;
-    }
+    // 两个维度是 AND: 平台 + 标记(赞/藏/关注) 可同时生效
+    if (plat !== 'all' && platLabel(it) !== plat) return false;
+    if (flag === 'like'   && !LIKE[it.id]) return false;
+    if (flag === 'fav'    && !FAV[it.id]) return false;
+    if (flag === 'follow' && !FOLLOW[it.author || '']) return false;
     if (!q) return true;
     return (it.author || '').toLowerCase().includes(q)
         || (it.title  || '').toLowerCase().includes(q)
@@ -900,8 +920,16 @@ function buildGrid() {
   $('#gCount').textContent = VIEW.length + ' / ' + ITEMS.length;
 
   if (!VIEW.length) {
+    const hint = (flag === 'like' && !Object.keys(LIKE).length)
+      ? '还没有点赞过的视频<br><span style="opacity:.7">刷视频时点右边的 ❤ 就能标记</span>'
+      : (flag === 'fav' && !Object.keys(FAV).length)
+      ? '还没有收藏标记的视频<br><span style="opacity:.7">点右边的 ★ 就能标记</span>'
+      : (flag === 'follow' && !Object.keys(FOLLOW).length)
+      ? '还没有关注任何作者<br><span style="opacity:.7">点作者名旁边的「关注」</span>'
+      : '没有匹配的视频';
     gBody.innerHTML = '<div style="grid-column:1/-1;text-align:center;color:#4a4a52;'
-      + 'font-size:12px;padding:30px 0">没有匹配的视频</div>';
+      + 'font-size:12px;padding:30px 0;line-height:1.9">' + hint + '</div>';
+    refreshFlagCounts();
     return;
   }
   const frag = document.createDocumentFragment();
@@ -931,6 +959,22 @@ function buildGrid() {
   gBody.innerHTML = '';
   gBody.appendChild(frag);
   highlight();
+  refreshFlagCounts();
+}
+
+/* 当前是否有"标记"筛选生效(赞/藏/关注) */
+function flagActive() {
+  const on = $('#gFlags .chip.on');
+  return !!on && on.dataset.f && on.dataset.f !== 'all';
+}
+
+/* 每个筛选后面跟一个计数, 让用户一眼看到"我赞了多少" */
+function refreshFlagCounts() {
+  const tag = {like: LIKE, fav: FAV, follow: FOLLOW};
+  for (const k of ['like', 'fav', 'follow']) {
+    const el = $('#cn' + k[0].toUpperCase() + k.slice(1));
+    if (el) el.textContent = Object.keys(tag[k]).length || '';
+  }
 }
 
 function jump(i) {
@@ -967,6 +1011,13 @@ $('#gChips').addEventListener('click', (e) => {
   const b = e.target.closest('.chip');
   if (!b) return;
   $$('#gChips .chip').forEach((c) => c.classList.toggle('on', c === b));
+  buildGrid();
+});
+
+$('#gFlags').addEventListener('click', (e) => {
+  const b = e.target.closest('.chip');
+  if (!b) return;
+  $$('#gFlags .chip').forEach((c) => c.classList.toggle('on', c === b));
   buildGrid();
 });
 
