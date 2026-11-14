@@ -1,8 +1,8 @@
-# 抖音 / 快手收藏自动下载 · v1.7.4
+# 抖音 / 快手收藏自动下载 · v2.0
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-1.7.4-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.0.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -165,6 +165,30 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.0
+
+**主题：双站点正式版 —— 抖音 + 快手，一个浏览器、一个面板、点收藏就下最高画质无水印原片。**
+
+这是一个正式的里程碑版本：快手接入完成、两条链路的坑都填平了，可以日常用。
+
+- **双站点支持**：同一个 Chrome 里刷抖音或快手，点哪个站的收藏就下哪个站，
+  不用切程序、不用开新窗口。登录墙、页面保活、自动翻页都认两个站点。
+- **快手走「搭便车 + 直链缓存」**：实测快手 CDN 的 mp4 地址不带签名、不需要 Cookie
+  也能下，且不会过期。所以快手收藏直接从页面自己发出的 feed 响应里拿那份码率表，
+  收藏动作一到就提交下载，**零延迟**，也完全绕开快手详情页那套「浏览器版本过低」风控。
+- **两套回传通道**：正常页走 `expose_binding`；Playwright attach 断掉的「半死页」
+  走独立 CDP websocket + `Runtime.addBinding`，完全不经过 Playwright。
+- **坏页看门狗**：渲染进程挂掉的页会让 `page.evaluate` 永久阻塞（`Page.evaluate`
+  没有 timeout 参数），主循环被钉死 → 两个站点全部收不到事件。现在先按 targetId
+  走 CDP 硬超时探活，不可达的页拉黑 120 秒跳过，`pump` 也不再摸不确定的页。
+- **补漏改按「真装好」判定**：`_hook_all_pages` 只跳过步骤 1 确认注入成功的 target，
+  其余站点页一律走纯 CDP 兜底，不再假设「在 `ctx.pages` 里就等于装好了」——
+  这条正是「退出重进快手就下不了」的根因。
+- **守护进程不再误判**：启动时撞上「已经有一个下载进程在运行」(exit 3) 不算秒退，
+  不会因为连点几次启动就放弃守护。
+- **测试**：241 例离线回归 + 一套 77 项 × 2 轮的全功能验收 harness
+  （`acceptance/verify.py`，含真浏览器注入钩子、真实 HTTP 下载链路、真面板接口）。
 
 ## v1.7.4
 
