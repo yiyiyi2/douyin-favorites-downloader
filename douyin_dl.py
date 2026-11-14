@@ -97,6 +97,8 @@ try:
         build_filename,
         build_session,
         download,
+        is_kuaishou_id,
+        parse_any,
         parse_aweme,
         probe_size,
         safe_name,
@@ -116,11 +118,28 @@ def refetch_aweme(aid: str, session) -> dict | None:
     以前每次调用都新起一个 chromium(启动 1~2 秒 + 加载 + 轮询), 单个视频要 45 秒,
     排队根本追不上翻页。现在改成常驻一个无头浏览器 + 一个专属线程, 每次只新开一个
     标签页, 一个视频 2~4 秒。
+
+    v1.7 快手: 直链不过期、不需要 Cookie, 所以快手 id 优先复用 submit() 时
+    存下来的那份包装对象(零网络、零风控风险); 只有缓存里没有才走无头兜底。
     """
+    if is_kuaishou_id(aid):
+        with _ks_last_lock:
+            cached = _KS_LAST.get(aid)
+        if cached:
+            return cached
+        # 缓存里没有(通常是进程重启后面板点重试): 抖音那套 _hd_fetch 会拿
+        # photoId 去开 douyin.com/video/ 白等 30 秒, 快手详情页又有版本风控,
+        # 都不可靠。直接返回 None, 让面板提示"重新收藏一次即可恢复"。
+        return None
     with _refetch_lock:
         return _hd_fetch(aid)
 
 
+# v1.7: 最近提交过的快手包装对象。重试时不再打开详情页。
+# 有上限, 长跑不会吃内存; 集合小(几十个), 线性淘汰足够。
+_KS_LAST: dict[str, dict] = {}
+_KS_LAST_CAP = 200
+_ks_last_lock = threading.Lock()
 _refetch_lock = threading.Lock()
 
 # 常驻无头浏览器的请求队列: (aid, cookies, box)
@@ -382,11 +401,18 @@ class Downloader(threading.Thread):
 
     def submit(self, aweme: dict, source: str):
         self.q.put((aweme, source))
+        aid = str(aweme.get("aweme_id") or "")
+        # v1.7: 快手直链不过期, 把包装对象留一份给「重试」用。
+        # 重试时不需要再开无头详情页(会被快手风控挡), 直接复用这份即可。
+        if aid and is_kuaishou_id(aid):
+            with _ks_last_lock:
+                _KS_LAST[aid] = aweme
+                while len(_KS_LAST) > _KS_LAST_CAP:
+                    _KS_LAST.pop(next(iter(_KS_LAST)), None)
         if self.bus:
-            aid = str(aweme.get("aweme_id") or "")
             if aid:
                 try:
-                    _i = parse_aweme(aweme)
+                    _i = parse_any(aweme)
                     self._ev("add_waiting", aid, _i.desc[:60], _i.author, source)
                 except Exception:
                     self._ev("add_waiting", aid, "", "", source)
@@ -422,6 +448,8 @@ class Downloader(threading.Thread):
             return False, f"抓取异常: {str(e)[:60]}"
         if not aw:
             self.log(f"  ! 重试 {aid}: 拿不到视频信息")
+            if is_kuaishou_id(aid):
+                return False, "快手视频信息已失效, 往下滑一下让列表重新加载再收藏一次即可"
             return False, "拿不到视频详情(可能已删除/私密/需要重新登录)"
         # v1.6: 走 submit() 而不是直接 q.put(), 让面板收到 add_waiting,
         # 用户能在队列里看到这条正在重试, 而不是"点了没动静"。
@@ -464,7 +492,9 @@ class Downloader(threading.Thread):
                 self.count_fail += 1
                 return
 
-        info = parse_aweme(aweme)
+        # v1.7: 快手包装对象走 parse_kuaishou, 抖音原生对象走 parse_aweme。
+        # 两者都产 VideoInfo, 下面所有画质/文件名/落盘逻辑无需分支。
+        info = parse_any(aweme)
         if not info.aweme_id:
             return
 
@@ -718,7 +748,7 @@ def download_single(url: str, state: State) -> int:
 
 def _focus_existing_window(port: int = 9222) -> bool:
     """
-    第二次双击启动时, 把已经在跑的那个抖音窗口提到最前面。
+    第二次双击启动时, 把已经在跑的那个浏览器窗口(抖音 / 快手)提到最前面。
 
     不然用户只会看到"已经在运行了"然后什么都没有, 很像程序坏了。
     """
@@ -731,7 +761,9 @@ def _focus_existing_window(port: int = 9222) -> bool:
             browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=5000)
             pages = [pg for ctx in browser.contexts for pg in ctx.pages
                      if not pg.is_closed()]
-            pages.sort(key=lambda pg: 0 if "douyin.com" in (pg.url or "") else 1)
+            # v1.7: 两个站点都算"我们的窗口", 抖音优先排前面
+            pages.sort(key=lambda pg: 0 if any(
+                d in (pg.url or "") for d in ("douyin.com", "kuaishou.com")) else 1)
             for pg in pages:
                 try:
                     pg.bring_to_front()

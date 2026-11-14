@@ -37,6 +37,12 @@ UA = (
 # 抖音网页端接口取视频详情用的 Referer, 缺了会被 403
 REFERER = "https://www.douyin.com/"
 
+# v1.7 快手。实测快手 web 的 djvod/kwaicdn 直链是完全公开的:
+# 带不带 Cookie/Referer 都返回 200 video/mp4, 而且几十分钟前抓到的地址
+# 仍然能下(不像抖音签名几分钟就废)。所以快手这边不需要登录态,
+# 也不需要每次重新抓详情 —— 直接用页面自己加载 feed 时给的那份地址。
+REFERER_KS = "https://www.kuaishou.com/"
+
 _SAFE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 _NUM_RE = re.compile(r"-?\d+")
 
@@ -306,6 +312,164 @@ def parse_aweme(aweme: Any) -> VideoInfo:
         )
 
     return info
+
+
+# --------------------------------------------------------------------------
+# v1.7 快手
+#
+# 快手 web 的码率信息和抖音完全不是一个形状: 没有 bit_rate[],
+# 而是 manifest.adaptationSet[].representation[], 每一档带
+# url / backupUrl[] / width / height / avgBitrate / fileSize / qualityType。
+# 详情页更是把数据塞进 Apollo 客户端缓存(window.__APOLLO_STATE__),
+# 里面用 {"type":"id","id":"VisionVideoSetRepresentation:1"} 这种引用形式
+# 间接指向真正的对象, 必须解引用才能拿到地址 —— 这里统一处理两种形状。
+# --------------------------------------------------------------------------
+
+PLATFORM_DOUYIN = "douyin"
+PLATFORM_KUAISHOU = "kuaishou"
+
+_KS_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
+
+
+def is_kuaishou_id(v: Any) -> bool:
+    """快手的 photoId 形如 `3xb42hegyea3mzc`(字母数字混排), 抖音是纯数字。
+
+    判定规则刻意宽松: 8~32 位、只含字母数字/下划线/连字符、且字母和数字都有。
+    多认几个不会有坏处(调用方拿到后用真实接口再确认), 少认一个就永远下不了。
+    """
+    s = _as_str(v)
+    if not (8 <= len(s) <= 32) or not _KS_ID_RE.match(s):
+        return False
+    return any(c.isdigit() for c in s) and any(c.isalpha() for c in s)
+
+
+def _ks_deref(v: Any, client: dict | None = None, depth: int = 0) -> Any:
+    """解开 Apollo 缓存里的引用。
+
+    `{"type":"id","id":"VisionVideoAdaptationSet:1"}` -> client[那个 key]
+    `{"type":"json","json":{...}}`                    -> 里面的 json
+    其它形状原样(递归)返回。client 为 None 时只解 json 壳。
+    """
+    if depth > 8:
+        return v
+    if isinstance(v, list):
+        return [_ks_deref(x, client, depth + 1) for x in v]
+    if not isinstance(v, dict):
+        return v
+    t = v.get("type")
+    if t == "json" and "json" in v:
+        return _ks_deref(v.get("json"), client, depth + 1)
+    if t == "id" and client is not None:
+        key = v.get("id")
+        if isinstance(key, str) and key in client:
+            return _ks_deref(client.get(key), client, depth + 1)
+        return {}
+    return {k: _ks_deref(x, client, depth + 1) for k, x in v.items()}
+
+
+def _ks_iter_representations(photo: Any, client: dict | None = None) -> Iterable[dict]:
+    """遍历快手 photo 里的所有码率档(含 H.265 那份 manifest)。"""
+    photo = _as_dict(photo)
+    for key in ("manifest", "manifestH265"):
+        mf = _ks_deref(photo.get(key), client)
+        if not isinstance(mf, dict):
+            continue
+        for aset in _as_list(_ks_deref(mf.get("adaptationSet"), client)):
+            for rep in _as_list(_ks_deref(_as_dict(aset).get("representation"), client)):
+                rep = _as_dict(rep)
+                if rep.get("url") or rep.get("backupUrl"):
+                    yield rep
+
+
+def _ks_rep_urls(rep: dict, client: dict | None) -> list[str]:
+    """一档码率可能给主地址 + 若干 backupUrl, 全部收下当候选(下不动就换)。"""
+    urls: list[str] = []
+    u = _as_str(rep.get("url"))
+    if u.startswith("http"):
+        urls.append(u)
+    bu = _ks_deref(rep.get("backupUrl"), client)
+    for x in _as_list(bu if isinstance(bu, list) else [bu]):
+        x = _as_str(x)
+        if x.startswith("http") and x not in urls:
+            urls.append(x)
+    return urls
+
+
+def parse_kuaishou(photo: Any, client: dict | None = None) -> VideoInfo:
+    """把一个快手 photo 对象解析成 VideoInfo。
+
+    接受三种入参, 都能吃:
+      1. REST 接口里的 feeds[i].photo 原样
+      2. Apollo 里的 VisionVideoDetailPhoto:<id>(需同时给 client 才能解引用)
+      3. watcher 包的一层 {"aweme_id":..., "_platform":"kuaishou", "_ks": {...}}
+    """
+    photo = _as_dict(photo)
+    inner = _as_dict(photo.get("_ks"))
+    if inner:
+        if client is None:
+            client = _as_dict(photo.get("_ks_client")) or None
+        photo = inner
+    if client is None:
+        client = _as_dict(photo.get("_ks_client")) or None
+
+    pid = _as_str(photo.get("id") or photo.get("photoId") or photo.get("photo_id"))
+    info = VideoInfo(aweme_id=pid, raw=photo)
+
+    info.desc = _as_str(photo.get("caption")).strip()
+    ts = _as_int(photo.get("timestamp"), 0)
+    if ts > 100_000_000_000:          # 快手的 timestamp 是毫秒
+        ts //= 1000
+    info.create_time = ts if ts > 0 else 0
+    # 快手 duration 本来就是毫秒, 和抖音一致, 不用换算
+    info.duration = _as_int(photo.get("duration"), 0)
+
+    author = _as_dict(_ks_deref(photo.get("author"), client))
+    info.author = _as_str(author.get("name") or author.get("userName")).strip()
+    info.author_id = _as_str(author.get("id") or author.get("userId") or "")
+
+    cover = _as_str(photo.get("coverUrl") or photo.get("animatedCoverUrl"))
+    if cover.startswith("http"):
+        info.cover_urls = [cover]
+
+    seen: set[str] = set()
+    for rep in _ks_iter_representations(photo, client):
+        w = _as_int(rep.get("width"), 0)
+        h = _as_int(rep.get("height"), 0)
+        # avgBitrate 是"平均码率"(单位 kbps), maxBitrate 是峰值。
+        # 排序想用平均码率(更接近真实清晰度), 拿不到再退峰值。
+        br = _as_int(rep.get("avgBitrate") or rep.get("maxBitrate"), 0)
+        size = _as_int(rep.get("fileSize"), 0)
+        qk = _as_str(rep.get("qualityType") or "")
+        gear = _as_str(rep.get("qualityLabel") or "")
+        for url in _ks_rep_urls(rep, client):
+            if url in seen or _is_watermarked({}, url):
+                continue
+            seen.add(url)
+            info.candidates.append(
+                Candidate(url=url, width=w, height=h, bitrate=br, size=size,
+                          gear_name=gear, quality_key=qk)
+            )
+
+    # 兜底: manifest 结构一变(或页面只给了 photoUrl)时, 至少还能下 720p
+    if not info.candidates:
+        u = _as_str(photo.get("photoUrl"))
+        if u.startswith("http"):
+            info.candidates.append(
+                Candidate(url=u,
+                          width=_as_int(photo.get("width"), 0),
+                          height=_as_int(photo.get("height"), 0),
+                          gear_name="photoUrl")
+            )
+
+    return info
+
+
+def parse_any(obj: Any) -> VideoInfo:
+    """按平台自动选择解析器。快手对象带 `_platform`/`_ks` 标记。"""
+    obj = _as_dict(obj)
+    if obj.get("_platform") == PLATFORM_KUAISHOU or obj.get("_ks"):
+        return parse_kuaishou(obj)
+    return parse_aweme(obj)
 
 
 # --------------------------------------------------------------------------

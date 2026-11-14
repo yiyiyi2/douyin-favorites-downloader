@@ -375,10 +375,19 @@ def _rel_path(workspace: Path, rel) -> Path | None:
 
 
 def _safe_id(v) -> str:
-    """抖音的 aweme_id 只会是纯数字。thumb/delete/open 都会把它拼进文件路径,
-    这里统一拦一下, 免得被 ../ 之类的东西穿越出去。"""
+    """id 会被拼进文件路径, 这里统一拦一下, 免得被 ../ 之类的东西穿越出去。
+
+    v1.7: 抖音 aweme_id 是纯数字, 快手 photoId 是字母数字混排
+    (如 3xb42hegyea3mzc)。所以放宽成 ASCII 字母数字 + _ -, 但依然
+    只放行这一个白名单字符集 —— 斜杠、反斜杠、点、空格、中文一律挡掉,
+    路径穿越防护一点没松。
+    """
     s = str(v or "").strip()
-    return s if s.isdigit() and 5 <= len(s) <= 32 else ""
+    if not (5 <= len(s) <= 64):
+        return ""
+    if not all(c.isascii() and (c.isalnum() or c in "_-") for c in s):
+        return ""
+    return s
 
 
 def _clamp_gap(v) -> float:

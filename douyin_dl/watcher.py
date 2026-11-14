@@ -31,7 +31,11 @@ from typing import Any, Callable
 
 from playwright.sync_api import sync_playwright
 
-from douyin_dl.core import UA
+from douyin_dl.core import UA, PLATFORM_KUAISHOU, parse_kuaishou
+
+# v1.7: 两个站点一视同仁。判「浏览器里还有没有页面」「要不要自动开页」
+# 都得同时认这两个域名, 否则用户只刷快手时会被强开抖音页 / 被判关站。
+_SITE_DOMAINS = ("douyin.com", "kuaishou.com")
 
 # 主循环退出码。daemon.py 只把 EXIT_INTENTIONAL(7) 当"用户主动关, 别再拉起",
 # 其他码一律按"崩了"处理并重启。裸 return 会返回 None -> sys.exit(None)=0,
@@ -66,12 +70,12 @@ def _cap_set(s: set, limit: int) -> int:
 # writable —— 否则抛 "Invalid property descriptor", 钩子会静默失效。
 # 这个坑踩过一次, 这里保持正确写法。
 # ---------------------------------------------------------------------------
-HOOK_VER = 8   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
+HOOK_VER = 9   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
 
 HOOK_JS = r"""
 (() => {
   // 版本号: 改动钩子逻辑就 +1, 否则页面里的旧版本会靠守卫把新版本挡掉(踩过坑)
-  const HOOK_VER = 8;
+  const HOOK_VER = 9;
   if (window.__DY_HOOK_VER__ === HOOK_VER) return;
   // 需要搭便车的接口
   const DATA_EP = [
@@ -81,12 +85,21 @@ HOOK_JS = r"""
     "/aweme/v1/web/tab/feed",             // 信息流
     "/aweme/v1/web/aweme/related",        // 相关推荐
     "/aweme/v1/web/mix/aweme",            // 合集
+    // ---- v1.7 快手: /rest/v/... 风格, 形状和抖音完全不同 ----
+    "/rest/v/feed/hot",                   // 推荐流(每条带完整 manifest 码率表)
+    "/rest/v/profile/feed",               // 作者作品
+    "/rest/v/collect/list",               // 我的收藏列表
+    "/rest/v/feed/liked",                 // 我赞过的
+    "/rest/v/search/feed",                // 搜索结果
   ];
   // 收藏动作
   const ACT_EP = [
     "/aweme/v1/web/aweme/collect",
     "/aweme/v1/web/commit/item",
     "/aweme/v1/web/aweme/favorite",
+    // ---- v1.7 快手: 请求体 JSON {"photoId":..,"userId":..,"collect":1|2} ----
+    // collect=1 收藏 / collect=2 取消收藏。和抖音的 1/0 不一样, 别照抄。
+    "/rest/v/photo/collect",
   ];
 
   const hit = (u, arr) => !!u && arr.some((k) => u.includes(k));
@@ -102,6 +115,10 @@ HOOK_JS = r"""
 
   const ID_RE = new RegExp("[0-9]{15,}");
   const pickId = (s) => { const m = s && s.match(ID_RE); return m ? m[0] : ""; };
+  // 快手的 photoId 是短的首字母+数字串(如 3xb42hegyea3mzc), 抖音那套 15 位纯数字
+  // 正则完全对不上, 单独来一条。路径里一般就长这样: /short-video/<id>
+  const KS_RE = new RegExp("/(?:short-video|photo|fw/photo)/([0-9A-Za-z_-]{8,32})");
+  const pickKs = (s) => { const m = s && s.match(KS_RE); return m ? m[1] : ""; };
 
   const idFromNode = (el) => {
     // 1) 抖音详情页的播放容器上有 data-e2e-vid, 这是最可靠的
@@ -109,7 +126,17 @@ HOOK_JS = r"""
       const v = el.getAttribute && el.getAttribute("data-e2e-vid");
       if (v) return v;
     }
-    // 2) 退而求其次: 往上找带 id 的属性 / 链接 / data-e2e
+    // 2) v1.7 快手: 卡片上常挂 data-photo-id / data-video-id, 第 1 步认不到时试这里
+    let k = el;
+    for (let i = 0; i < 12 && k; i++, k = k.parentElement) {
+      if (!k.getAttribute) continue;
+      const pid = k.getAttribute("data-photo-id") || k.getAttribute("data-video-id");
+      if (pid) return pid;
+      const href = k.href || k.getAttribute("href") || "";
+      const kh = pickKs(href);
+      if (kh) return kh;
+    }
+    // 3) 退而求其次: 往上找带 id 的属性 / 链接 / data-e2e
     let n = el;
     for (let i = 0; i < 12 && n; i++, n = n.parentElement) {
       const a = (n.getAttribute && (n.getAttribute("data-e2e") || "")) || "";
@@ -123,9 +150,10 @@ HOOK_JS = r"""
       const got = pickId(a);
       if (got) return got;
     }
-    // 3) 最后从页面地址里取, 但必须保证是当前播放的那个
+    // 4) 最后从页面地址里取, 但必须保证是当前播放的那个
     const cur = location.href.match(new RegExp("/(?:video|note)/([0-9]{15,})"));
-    return cur ? cur[1] : "";
+    if (cur) return cur[1];
+    return pickKs(location.href) || "";
   };
 
   document.addEventListener("click", (ev) => {
@@ -138,7 +166,13 @@ HOOK_JS = r"""
         // 既没有 aria-label 也没有「收藏」两个字, 只能按 data-e2e 认。
         const e2e = (el.getAttribute && el.getAttribute("data-e2e")) || "";
         if (/collect|favorite/i.test(e2e)) { hit = true; mark = "e2e:" + e2e; break; }
-        const txt = ((el.innerText || "") + " " + (el.getAttribute?.("aria-label") || "")).trim();
+        // v1.7 快手: 没有 data-e2e, 收藏按钮靠 class / aria-label 认
+        // (实测类名里带 collect, 或者 title/aria-label 直接写「收藏」)。
+        const cls = (el.className || "").toString();
+        const lbl = (el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "");
+        if (/collect/i.test(cls) && cls.length < 200) { hit = true; mark = "cls:" + cls.slice(0, 40); break; }
+        if (lbl && lbl.length <= 12 && /收藏/.test(lbl)) { hit = true; mark = "lbl:" + lbl; break; }
+        const txt = ((el.innerText || "") + " " + lbl).trim();
         if (txt && txt.length <= 12 && /收藏/.test(txt)) { hit = true; mark = "text:" + txt; break; }
       }
       if (!hit) return;
@@ -156,7 +190,8 @@ HOOK_JS = r"""
       // 用户说「我明明没收藏」时, 靠它判断浏览器当时是不是把它当成了已收藏。
       let look = "";
       try {
-        const btn = (ev.target.closest && ev.target.closest('[data-e2e*="collect"]')) || null;
+        const btn = (ev.target.closest &&
+          ev.target.closest('[data-e2e*="collect"], [class*="collect"], [class*="Collect"]')) || null;
         if (btn) {
           look = [
             (btn.className || "").toString().slice(0, 80),
@@ -292,6 +327,21 @@ HOOK_JS = r"""
 _ID_KEYS = ("aweme_id", "awemeId", "item_id", "itemId", "object_id", "group_id", "id")
 _VIDEO_KEYS = ("video", "images", "image_list", "video_info", "play_addr", "aweme_detail")
 _ID_LIST_KEYS = ("aweme_ids", "item_ids", "aweme_list", "awemeIdList", "ids")
+
+# v1.7 快手: id 字段叫 photoId / photo_id, 视频信息叫 manifest / photoUrl。
+# 单列一套, 别和抖音那三个常量混在一起(混了会把 photo 对象当 aweme 抽错)。
+_KS_ID_KEYS = ("photoId", "photo_id", "id")
+_KS_VIDEO_KEYS = ("manifest", "manifestH265", "photoUrl", "photoUrls", "coverUrl")
+
+
+def _is_ks_id(v: Any) -> bool:
+    """是不是快手那种 photoId。抖音是纯数字, 快手是字母数字混排。"""
+    s = str(v or "").strip()
+    if not (8 <= len(s) <= 32):
+        return False
+    if not all(c.isalnum() or c in "_-" for c in s):
+        return False
+    return any(c.isdigit() for c in s) and any(c.isalpha() for c in s)
 
 
 def _norm_id(v: Any) -> str:
@@ -479,6 +529,162 @@ def action_value(url: str, body: Any = None, req: Any = None) -> str:
 def is_uncollect(url: str, body: Any, req: Any) -> bool:
     """是不是「取消收藏」。只有明确带 action=0 才算; 没有 action 的同步请求不算取消。"""
     return action_value(url, body, req) == "0"
+
+
+# ---------------------------------------------------------------------------
+# v1.7 快手: 从 /rest/v/... 的响应/请求体里挖 photo
+# ---------------------------------------------------------------------------
+
+def looks_like_ks_photo(node: Any) -> bool:
+    """一个对象像不像快手的 photo。"""
+    node = node if isinstance(node, dict) else {}
+    if not _is_ks_id(node.get("id") or node.get("photoId")):
+        return False
+    return any(k in node for k in _KS_VIDEO_KEYS)
+
+
+def extract_ks_photos(obj: Any) -> list[dict]:
+    """递归找出所有快手 photo 对象。
+
+    快手的形状: {result, pcursor, feeds: [{photo: {...}, author: {...}}]}
+    以及收藏列表：{feeds: [{photo: {...}}]} —— 结构一致, 都是往 feeds 里找。
+    """
+    found: list[dict] = []
+    seen: set[int] = set()
+
+    def walk(node: Any, depth: int = 0):
+        if depth > 12:
+            return
+        if isinstance(node, dict):
+            if looks_like_ks_photo(node):
+                if id(node) not in seen:
+                    seen.add(id(node))
+                    found.append(node)
+                return
+            # v1.7 关键: 真实 REST feed 里 author 和 photo 是**平级**的,
+            # 长这样  feeds[i] = {photo:{...}, author:{id,name,...}, ...}
+            # 只取 photo 会丢作者名(文件名/面板都显示成"未知作者"), 这里把
+            # 平级的 author 合进 photo 再缓存。Apollo 详情页里 author 本来
+            # 就在 photo 内或由 _hl_fetch_ks 挂上, 不会重复。
+            ph = node.get("photo")
+            if isinstance(ph, dict) and looks_like_ks_photo(ph):
+                merged = dict(ph)
+                a = node.get("author")
+                if isinstance(a, dict) and a and "author" not in merged:
+                    merged["author"] = a
+                if id(ph) not in seen:
+                    seen.add(id(ph))
+                    found.append(merged)
+                # 别再遍历 node.values(), 免得把没合并 author 的 ph 又收一遍
+                return
+            for v in node.values():
+                walk(v, depth + 1)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, depth + 1)
+        elif isinstance(node, str):
+            t = node.strip()
+            if t.startswith("{") and len(t) < 8 * 1024 * 1024:
+                try:
+                    walk(json.loads(t), depth + 1)
+                except Exception:
+                    pass
+
+    walk(obj)
+    return found
+
+
+def collect_ks_ids(obj: Any) -> list[str]:
+    """从快手收藏接口的请求/响应里找出 photoId。"""
+    ids: list[str] = []
+
+    def add(v):
+        t = str(v or "").strip()
+        if t and _is_ks_id(t) and t not in ids:
+            ids.append(t)
+
+    def walk(node: Any, depth: int = 0):
+        if depth > 8:
+            return
+        if isinstance(node, dict):
+            for k in ("photoId", "photo_id"):
+                if k in node:
+                    add(node.get(k))
+            for v in node.values():
+                if isinstance(v, (dict, list)):
+                    walk(v, depth + 1)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v, depth + 1)
+        elif isinstance(node, str) and node.strip().startswith("{"):
+            try:
+                walk(json.loads(node), depth + 1)
+            except Exception:
+                pass
+
+    walk(obj)
+    return ids
+
+
+def ks_ids_from_url(url: str) -> list[str]:
+    """快手详情页地址里的 photoId: /short-video/<id> 或 ?photoId=<id>。"""
+    ids: list[str] = []
+    try:
+        m = re.search(r"/(?:short-video|photo|fw/photo)/([0-9A-Za-z_-]{8,32})",
+                      url or "")
+        if m and _is_ks_id(m.group(1)):
+            ids.append(m.group(1))
+        qs = (url or "").split("?", 1)[1] if "?" in (url or "") else ""
+        for k, v in parse_qsl(qs, keep_blank_values=False):
+            if k.lower() in ("photoid", "photo_id") and _is_ks_id(v):
+                if v not in ids:
+                    ids.append(v)
+    except Exception:
+        pass
+    return ids
+
+
+def ks_action_value(url: str, body: Any = None, req: Any = None) -> str:
+    """快手这次 /rest/v/photo/collect 到底在干嘛, 返回 "1"(收藏)/"0"(取消)/""。
+
+    实测(2026-11-13, 从 SwiperFeed-*.js 反混淆源码读出):
+      `collect: photo.collected ? 2 : 1`  →  collect=1 收藏, collect=2 取消收藏
+    注意这和抖音的 1/0 语义不同, 千万别照抄 _action_norm。
+    """
+    def pick(src) -> str:
+        if isinstance(src, str) and src.strip().startswith("{"):
+            try:
+                src = json.loads(src)
+            except Exception:
+                return ""
+        if not isinstance(src, dict):
+            return ""
+        for k in ("collect", "collectAction"):
+            if k in src:
+                try:
+                    n = int(src.get(k))
+                except Exception:
+                    continue
+                if n == 1:
+                    return "1"
+                if n == 2:
+                    return "0"
+        return ""
+
+    for src in (req, body):
+        a = pick(src)
+        if a:
+            return a
+    # 兜底: 有些调用把 collect 放 query 里
+    try:
+        qs = (url or "").split("?", 1)[1] if "?" in (url or "") else ""
+        for k, v in parse_qsl(qs, keep_blank_values=False):
+            if k.lower() == "collect":
+                n = int(v)
+                return "1" if n == 1 else ("0" if n == 2 else "")
+    except Exception:
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -711,10 +917,152 @@ class BrowserWatcher:
                 return {}
         return {}
 
+    # -- v1.7 快手 ----------------------------------------------------------
+    @staticmethod
+    def _is_ks_url(url: str) -> bool:
+        """这条流量是不是快手的。
+
+        用域名 + 接口前缀双判定: 详情页/推荐页的 href 带 kuaishou.com,
+        而 XHR 里的 url 有时是相对路径 `/rest/v/...`, 不带域名。
+        """
+        u = (url or "").lower()
+        return "kuaishou.com" in u or "gifshow.com" in u or "/rest/v/" in u
+
+    def _on_ks_payload(self, kind: str, url: str, body: Any, req: Any,
+                       body_text: str, req_text: str):
+        """快手事件独立分支。
+
+        和抖音最本质的区别: 快手 CDN 直链**不过期、不需要 Cookie**
+        (实测几十分钟前抓到的地址仍能裸请求下完 23MB), 所以收藏时
+        **直接用 feed 响应里缓存的那份 photo 就行**, 不用像抖音那样
+        每次都重新打开详情页抓签名地址。这样既快又完全绕开快手
+        详情页那套「浏览器版本过低」风控。
+        """
+        if kind == "click":
+            # 诊断用, 和抖音 click 分支保持同样的可读性
+            try:
+                info = json.loads(body_text) if (body_text or "").strip().startswith("{") else {}
+            except Exception:
+                info = {}
+            self.log(f"  · 检测到快手收藏点击 [{info.get('mark') or '?'}] "
+                     f"视频={info.get('id') or '未知'}")
+            return
+
+        if kind == "data":
+            photos = extract_ks_photos(body)
+            if not photos:
+                return
+            wrapped: list[dict] = []
+            for ph in photos:
+                pid = str(ph.get("id") or ph.get("photoId") or "")
+                if not _is_ks_id(pid):
+                    continue
+                wrapped.append({
+                    "aweme_id": pid,
+                    "_platform": PLATFORM_KUAISHOU,
+                    "_ks": ph,
+                })
+            if not wrapped:
+                return
+            self._remember(wrapped)
+
+            if "/rest/v/collect/list" in url:
+                # 和抖音 listcollection 同规矩: 收藏列表只用来建基线/缓存
+                # 候选数据, 绝不作为下载触发(第一页内容会自己轮换, 靠列表
+                # 比对会把旧收藏当成新收藏重下)。
+                with self._lock:
+                    fresh_baseline = not self.baseline_done
+                    self.baseline_done = True
+                    self.known_favs.update(w["aweme_id"] for w in wrapped)
+                    if len(self.known_favs) > _SET_CAP_FAVS:
+                        _cap_set(self.known_favs, _SET_CAP_FAVS)
+                if fresh_baseline and self.download_all_on_start:
+                    self.log(f"  快手收藏基线: {len(wrapped)} 个, 开始回补下载")
+                    for w in wrapped:
+                        self.on_aweme(w, "快手收藏列表")
+                elif fresh_baseline:
+                    self.log(f"  快手收藏基线: 已记录 {len(wrapped)} 个已有收藏(只下新的)")
+                return
+
+            # 自动下推荐页: 和抖音同一开关, 三道防线去重
+            if self.auto_recommend and any(
+                k in url for k in ("/rest/v/feed/", "/rest/v/profile/feed",
+                                   "/rest/v/search/feed")
+            ):
+                todo: list[dict] = []
+                with self._lock:
+                    for w in wrapped:
+                        aid = w["aweme_id"]
+                        if aid in self._auto_submitted or aid in self.known_favs:
+                            continue
+                        self._auto_submitted.add(aid)
+                        todo.append(w)
+                    if len(self._auto_submitted) > _SET_CAP_AUTO:
+                        _cap_set(self._auto_submitted, _SET_CAP_AUTO)
+                if todo:
+                    self.log(f"  快手推荐页: 新增 {len(todo)} 个视频进队列 "
+                             f"(累计提交 {len(self._auto_submitted)})")
+                    for w in todo:
+                        try:
+                            # 「快手推荐」不是「推荐页」: Downloader.process 只
+                            # 对后者做详情页重抓, 快手直链不过期, 无需重抓。
+                            self.on_aweme(w, "快手推荐")
+                        except Exception as e:
+                            self.log(f"  ! 快手推荐提交失败 {w['aweme_id']}: {e}")
+                            with self._lock:
+                                self._auto_submitted.discard(w["aweme_id"])
+            return
+
+        if kind == "action":
+            act = ks_action_value(url, body, req)
+            ids = (collect_ks_ids(req) or ks_ids_from_url(url)
+                   or collect_ks_ids(body)[:1])
+            self.log(f"  · 快手收藏接口 collect={act or '?'} "
+                     f"req={req_text[:120] if req_text else '(空)'}")
+            if not ids:
+                return
+            if act == "0":
+                self.log(f"  · 取消收藏 {ids[0]} (不下载)")
+                with self._lock:
+                    self._pending_actions = [a for a in self._pending_actions
+                                             if a != ids[0]]
+                return
+            if act != "1":
+                self.log(f"  · 忽略快手状态同步请求 {ids[0]} (没有 collect)")
+                return
+            for aid in ids[:8]:
+                cached = self._get_cached(aid)
+                if cached:
+                    # 命中 feed 缓存 → 立刻提交, 面板几乎零延迟
+                    self.log(f"  · 新收藏 {aid} (快手), 已拿到视频信息, 直接下载")
+                    try:
+                        self.on_aweme(cached, "快手收藏")
+                    except Exception as e:
+                        self.log(f"  ! 快手收藏提交失败 {aid}: {e}")
+                    continue
+                # 冷启动或从分享链接直接进详情页时可能没缓存,
+                # 才走无头详情页兜底(可能被风控挡, 失败会明确报给面板)
+                with self._lock:
+                    if aid in self._pending_actions:
+                        continue
+                    self._pending_actions.append(aid)
+                try:
+                    self.on_pending(aid)
+                except Exception:
+                    pass
+                self.log(f"  · 新收藏 {aid} (快手), 正在抓取最新视频信息…")
+            return
+
     def _on_payload(self, kind: str, url: str, body_text: str,
                     req_text: str, meta: dict = None):
         body = self._parse_body(body_text)
         req = self._parse_body(req_text)
+
+        # v1.7: 快手走完全独立的一套解析。两边接口形状毫无共性
+        # (快手 /rest/v/..., 抖音 /aweme/v1/...), 硬塞进同一个分支只会互相干扰。
+        if self._is_ks_url(url):
+            self._on_ks_payload(kind, url, body, req, body_text, req_text)
+            return
 
         if kind == "click":
             # 诊断: 确认「用户点了收藏按钮」这件事有没有走到 Python。
@@ -981,13 +1329,21 @@ class BrowserWatcher:
                     pass
 
     def _hl_fetch(self, page, ctx, aid, cookies):
-        """在无头页面里打开视频, 等 /aweme/detail/ 返回带 aweme_detail 的 JSON。"""
+        """在无头页面里打开视频, 等详情数据回来。
+
+        v1.7: 抖音走 /aweme/detail/ 响应; 快手走 window.__APOLLO_STATE__。
+        按 id 形状分派(抖音纯数字、快手字母数字混排), 不用额外传站点参数,
+        队列里仍是原来的 (aid, cookies) 二元组。
+        """
         try:
             ctx.clear_cookies()
             if cookies:
                 ctx.add_cookies(cookies)
         except Exception:
             pass
+
+        if _is_ks_id(aid):
+            return self._hl_fetch_ks(page, aid)
 
         got: dict[str, Any] = {}
 
@@ -1016,6 +1372,73 @@ class BrowserWatcher:
             except Exception:
                 pass
         return got.get("aweme")
+
+    def _hl_fetch_ks(self, page, aid: str):
+        """快手兜底: 打开详情页读 window.__APOLLO_STATE__ 并解引用。
+
+        只在「feed 缓存里没这条」时才会走到这里(例如用户从分享链接
+        直接进详情页点收藏)。快手详情页有版本/自动化风控, 可能只返回
+        14 个配置键而没有 photo —— 那就返回 None, 上层会明确报失败,
+        用户往下滑一下让 feed 重新加载再点一次收藏即可。
+
+        Apollo 里全是 {"type":"id","id":"VisionVideoSetRepresentation:1"}
+        这种引用, 必须在 JS 里递归解引用成普通对象再回传, 否则 Python
+        拿到的只是个指针, 一个候选都解析不出来。
+        """
+        js = r"""
+        (pid) => {
+          const s = window.__APOLLO_STATE__;
+          if (!s) return null;
+          const C = s.defaultClient || s;
+          const deref = (v, d) => {
+            if (d > 8 || v === null || v === undefined) return v;
+            if (typeof v !== "object") return v;
+            if (Array.isArray(v)) return v.map(x => deref(x, d + 1));
+            if (v.type === "json" && "json" in v) return deref(v.json, d + 1);
+            if (v.type === "id" && typeof v.id === "string" && C[v.id])
+              return deref(C[v.id], d + 1);
+            const o = {};
+            for (const k of Object.keys(v)) o[k] = deref(v[k], d + 1);
+            return o;
+          };
+          const key = "VisionVideoDetailPhoto:" + pid;
+          const raw = C[key];
+          if (!raw) return null;
+          const photo = deref(raw, 0);
+          // 和 photo 同级的作者信息也在 client 里, 顺手挂上去
+          for (const k of Object.keys(C)) {
+            if (k.indexOf("VisionVideoDetailAuthor:") === 0) {
+              photo.author = deref(C[k], 0);
+              break;
+            }
+          }
+          return photo;
+        }
+        """
+        try:
+            page.goto(f"https://www.kuaishou.com/short-video/{aid}",
+                      wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            self.log(f"  ! 打开快手详情页失败 {aid}: {str(e)[:60]}")
+            return None
+        for _ in range(20):                     # 最多等 10 秒
+            try:
+                photo = page.evaluate(js, aid)
+            except Exception:
+                photo = None
+            if isinstance(photo, dict) and (photo.get("manifest")
+                                            or photo.get("photoUrl")):
+                info = parse_kuaishou(photo)
+                if info.candidates:
+                    self.log(f"  · 快手详情页拿到了 {aid} 的 "
+                             f"{len(info.candidates)} 个画质候选")
+                    return {"aweme_id": aid, "_platform": PLATFORM_KUAISHOU,
+                            "_ks": photo}
+                return None
+            page.wait_for_timeout(500)
+        self.log(f"  ! 快手详情页没给视频数据 {aid} "
+                 "(被风控挡了, 往下滑一下让 feed 重新加载再收藏一次即可)")
+        return None
 
     def _ensure_hl_worker(self):
         if self._hl_thread is not None and self._hl_thread.is_alive():
@@ -1100,15 +1523,18 @@ class BrowserWatcher:
 
     def _ensure_douyin_tab(self, ctx):
         """
-        保证浏览器里有一个能刷的抖音页面。
+        保证浏览器里有一个能刷的站点页面(抖音或快手都算)。
 
         踩过的坑: 为了"不打扰用户"把启动时的 goto 删了, 结果冷启动后窗口里只有
         一个 about:blank —— 用户看到的是白屏, 以为浏览器坏了。
-        这里的规矩: 已经有抖音页就一个字都不动; 全都没有才自己开一个。
+        这里的规矩: 已经有站点页就一个字都不动; 全都没有才自己开一个。
+
+        v1.7: 只认抖音会把「只开了快手页」误判成没页面, 于是每 60 秒强开
+        一个抖音标签页、把用户正在刷的快手挤到后台。两个站点一视同仁。
         """
         for pg in list(ctx.pages):
             try:
-                if "douyin.com" in (pg.url or ""):
+                if any(d in (pg.url or "") for d in _SITE_DOMAINS):
                     return pg
             except Exception:
                 continue
@@ -1185,7 +1611,7 @@ class BrowserWatcher:
                 self._pending_actions.extend(todo)
             return
 
-        cookies = self._douyin_cookies()
+        cookies = self._douyin_cookies() + self._ks_cookies()
         for aid in todo:
             self._resolving.add(aid)
             self._hl_in.put((aid, cookies))
@@ -1227,10 +1653,17 @@ class BrowserWatcher:
 
     def _douyin_cookies(self):
         """把已登录浏览器里的抖音 Cookie 抠出来, 给无头浏览器用。"""
+        return self._cookies_for("douyin")
+
+    def _ks_cookies(self):
+        """快手 Cookie(游客态也有一组, 详情页风控可能会看)。"""
+        return self._cookies_for("kuaishou")
+
+    def _cookies_for(self, domain_key: str) -> list:
         out = []
         try:
             for c in self._ctx.cookies():
-                if "douyin" not in (c.get("domain") or ""):
+                if domain_key not in (c.get("domain") or ""):
                     continue
                 out.append({
                     "name": c["name"], "value": c["value"],
@@ -1322,6 +1755,13 @@ class BrowserWatcher:
         "uid_tt", "uid_tt_ss",
     })
 
+    # 快手游客态也有 kwssectoken/kwscode/kwfv1 这几个(实测 9 个游客 cookie),
+    # 所以**绝不能**拿它们当登录标志 —— 会把游客态误判成已登录。
+    # 快手这边根本不需要判登录: 收藏动作是用户浏览器自己发的(没登录就点不了),
+    # 而 CDN 直链是公开的、下载不要 Cookie。所以只要浏览器里确实开着快手页,
+    # 就认为「至少快手这条路可用」, 别让只用快手的用户干等 10 分钟抖音登录墙。
+    _KS_PAGE_DOMAINS = ("kuaishou.com",)
+
     @classmethod
     def check_login(cls, ctx) -> bool:
         try:
@@ -1331,9 +1771,17 @@ class BrowserWatcher:
             for c in ctx.cookies():
                 if c.get("name") in cls._LOGIN_COOKIES and c.get("value"):
                     return True
-            return False
         except Exception:
-            return False
+            pass
+        # v1.7: 抖音没登录、但用户确实开着快手页 → 让监听继续跑。
+        # 抖音那条路此时会 403 并明确报失败, 但快手收藏照常能下。
+        try:
+            for pg in ctx.pages:
+                if any(d in (pg.url or "") for d in cls._KS_PAGE_DOMAINS):
+                    return True
+        except Exception:
+            pass
+        return False
 
     # -- 主循环 ------------------------------------------------------------
     def run(self):
@@ -1379,7 +1827,7 @@ class BrowserWatcher:
                 if not self.check_login(ctx):
                     self.log("")
                     self.log("  ┌─────────────────────────────────────────────┐")
-                    self.log("  │  请在弹出的浏览器窗口里扫码登录抖音          │")
+                    self.log("  │  请在弹出的浏览器窗口里登录抖音或快手        │")
                     self.log("  │  登录后会自动继续, 无需其他操作              │")
                     self.log("  └─────────────────────────────────────────────┘")
                     self.log("")
@@ -1408,7 +1856,8 @@ class BrowserWatcher:
                 except Exception:
                     pass
                 self.log("  ✔ 监听已启动")
-                self.log("    现在去抖音正常刷、点『收藏』, 视频会自动下载到 downloads/")
+                self.log("    现在去抖音 / 快手正常刷、点『收藏』, "
+                         "视频会自动下载到 downloads/")
                 self.log("    按 Ctrl+C 退出")
                 self.log("")
 
@@ -1487,8 +1936,9 @@ class BrowserWatcher:
                             try:
                                 _tabs = _json.loads(_ur.urlopen(
                                     f"http://127.0.0.1:{self.port}/json/list", timeout=5).read())
-                                _has_dy = any("douyin.com" in t.get("url", "")
-                                              for t in _tabs if t.get("type") == "page")
+                                _has_dy = any(
+                                    any(d in t.get("url", "") for d in _SITE_DOMAINS)
+                                    for t in _tabs if t.get("type") == "page")
                             except Exception:
                                 _has_dy = bool([x for x in ctx.pages if not x.is_closed()])
                             if not _has_dy:
@@ -1558,6 +2008,15 @@ class BrowserWatcher:
                     if pg.is_closed():
                         continue
                     u = pg.url or ""
+                    # v1.7 快手推荐页: /new-reco 是全屏 Swiper, 按 ↓ 切下一条,
+                    # 页面自己会发 /rest/v/feed/hot 请求, 钩子照常搭便车。
+                    if "kuaishou.com" in u:
+                        if not ("/new-reco" in u or "/reco" in u
+                                or u.rstrip("/").count("/") <= 2):
+                            continue
+                        pg.keyboard.press("ArrowDown")
+                        self.log("  · 自动翻页: 快手推荐流下一条")
+                        return  # 一轮只翻一次
                     if "douyin.com" not in u:
                         continue
                     # 只翻推荐页(推荐 tab 的 url 是 /?recommend=1 或 /recommend 或根路径的推荐流)
@@ -1579,6 +2038,12 @@ class BrowserWatcher:
         """
         把浏览器里的登录 Cookie 同步给下载器。
         抖音的视频地址带 tk=webid, 是绑定登录态的; 不带 Cookie 直接 GET 会 403。
+
+        v1.7: 这里**只同步抖音 cookie**。快手 CDN 直链是公开的
+        (实测裸请求就能 200 下完 23MB), 不需要任何 Cookie; 把快手那堆
+        kwpsecproductname/kwssectoken 混进抖音的 Cookie 头反而可能让
+        抖音 CDN 挑刺, 所以刻意不合并。快手登录态只用于「点收藏」这个
+        页面动作, 那是用户浏览器自己的事。
         """
         try:
             parts = []
