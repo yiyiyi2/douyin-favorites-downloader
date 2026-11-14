@@ -1021,6 +1021,58 @@ class EventBus:
             pass
         return None
 
+    # -- 离线播放器用到的两个东西 -------------------------------------------
+    def library(self) -> list[dict]:
+        """给离线播放器用的视频库 = _recent() 里"文件确实在"的那些。
+
+        只多给播放器真正需要的字段, 不把 _recent 的全套都甩出去。
+        `src` 是 /api/video?id=<aid> 而不是磁盘路径 —— 浏览器拿不到本地
+        路径, 而且这样服务端还能统一做 Range 和路径校验。
+        """
+        out: list[dict] = []
+        for x in self._recent():
+            if x.get("type") != "video":
+                continue
+            sz = x.get("size") or 0
+            if sz <= 0:
+                continue                      # 文件早被删了, 别放进播放列表
+            aid = x.get("id") or ""
+            if not aid:
+                continue
+            out.append({
+                "id": aid,
+                "src": f"/api/video?id={aid}",
+                "title": x.get("title") or "",
+                "author": x.get("author") or "",
+                "music": x.get("music") or "",
+                "quality": x.get("quality") or "",
+                "duration": x.get("duration") or 0,
+                "size": sz,
+                "time": x.get("time") or 0,
+                "has_thumb": (self.thumbs_dir / f"{aid}.jpg").exists(),
+            })
+        return out
+
+    def video_path(self, aid: str) -> Path | None:
+        """aid -> 磁盘上的 mp4 路径。只认 .state.json 里登记过、且真在磁盘上的。"""
+        aid = _safe_id(aid)
+        if not aid:
+            return None
+        for x in self._recent():
+            if x.get("id") != aid or x.get("type") != "video":
+                continue
+            p = _rel_path(self.workspace, x.get("file"))
+            if p is None:
+                return None
+            # 二次确认没跑出工作区(符号链接/短路径都可能绕过纯字符串判定)
+            try:
+                if not p.is_file() or not str(p.resolve()).startswith(str(self.workspace.resolve())):
+                    return None
+            except OSError:
+                return None
+            return p
+        return None
+
 
 # ---------------------------------------------------------------------------
 # HTTP
@@ -1029,6 +1081,7 @@ class EventBus:
 class _Handler(BaseHTTPRequestHandler):
     bus: EventBus = None          # type: ignore
     web_file: Path = None         # type: ignore
+    _player_file: Path = None     # type: ignore  # 离线播放器页面
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *a):    # 别把每个请求都打到控制台
@@ -1064,6 +1117,85 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _serve_video(self):
+        """把 mp4 流式发给浏览器, 支持 Range —— 进度条才能拖动。
+
+        不用 SimpleHTTPRequestHandler 是因为这里要按 aid 白名单取路径,
+        不能让请求里的路径直接决定读哪个文件。
+        """
+        u = urlparse(self.path)
+        aid = _safe_id((parse_qs(u.query).get("id") or [""])[0])
+        p = self.bus.video_path(aid) if aid else None
+        if p is None:
+            self._json({"error": "视频不存在或已被删除"}, 404)
+            return
+
+        try:
+            total = p.stat().st_size
+        except OSError:
+            self._json({"error": "文件读不到"}, 500)
+            return
+
+        ctype = "video/mp4"
+        rng = (self.headers.get("Range") or "").strip()
+        start, end = 0, total - 1
+        partial = False
+        if rng.startswith("bytes="):
+            spec = rng[6:].split(",")[0].strip()
+            a, _, b = spec.partition("-")
+            try:
+                if a == "" and b != "":                 # bytes=-N  (最后 N 字节)
+                    n = int(b)
+                    if n > 0:
+                        start, partial = max(0, total - n), True
+                elif a != "":
+                    start, partial = max(0, int(a)), True
+                    if b != "":
+                        end = min(int(b), total - 1)
+            except ValueError:
+                start, end, partial = 0, total - 1, False
+
+        if partial and start >= total:
+            # 越界 Range 按 RFC 该回 416, 并告诉对方真实长度
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{total}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        n = end - start + 1
+        try:
+            f = open(p, "rb")
+        except OSError:
+            self._json({"error": "文件读不到"}, 500)
+            return
+        try:
+            f.seek(start)
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(n))
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            # 视频文件不会变, 但换个同名文件也得能播, 用长度+mtime 当弱校验
+            try:
+                self.send_header("ETag", f'"{total}-{int(p.stat().st_mtime)}"')
+            except OSError:
+                pass
+            self.send_header("Cache-Control", "public, max-age=3600")
+            self.end_headers()
+            left = n
+            while left > 0:
+                chunk = f.read(min(256 * 1024, left))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass                              # 用户拖进度条/切视频, 正常现象
+        finally:
+            f.close()
+
     def _route_get(self):
         u = urlparse(self.path)
         path = u.path
@@ -1082,6 +1214,24 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": f"界面文件读不到: {e}"}, 500)
                 return
             self._bytes(html, "text/html; charset=utf-8", cache=False)
+            return
+
+        # -- 离线播放器 ---------------------------------------------------
+        if path in ("/player", "/player.html", "/play"):
+            try:
+                html = self._player_file.read_bytes()
+            except Exception as e:
+                self._json({"error": f"播放器页面读不到: {e}"}, 500)
+                return
+            self._bytes(html, "text/html; charset=utf-8", cache=False)
+            return
+
+        if path == "/api/library":
+            self._json({"items": self.bus.library()})
+            return
+
+        if path == "/api/video":
+            self._serve_video()
             return
 
         if path == "/api/state":
@@ -1493,6 +1643,9 @@ def start_ui(bus: EventBus, web_file: Path, port: int = 8899,
     """
     _Handler.bus = bus
     _Handler.web_file = web_file
+    # 播放器页面跟主面板放同一个 web 目录; 找不到时退化成主面板(总比 500 好)
+    _p = Path(web_file).parent / "player.html"
+    _Handler._player_file = _p if _p.exists() else Path(web_file)
     url = f"http://127.0.0.1:{port}/"
 
     def _probe_state() -> bool:

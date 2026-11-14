@@ -307,7 +307,9 @@
         <i class="si"></i>B站</button>
     </div>
     <button class="ghost" onclick="toggleLog(true)">设置 / 日志</button>
-    <button class="primary" onclick="openWhat('folder')">下载文件夹</button>
+    <button class="primary" onclick="openPlayer()"
+       title="像刷抖音一样刷本地已下载的视频（完全不联网）">离线刷视频</button>
+    <button onclick="openWhat('folder')">下载文件夹</button>
     <button onclick="toggleDrawer(true)">设置</button>
   </div>
 </header>
@@ -946,6 +948,10 @@ function toggleDrawer(on){
 function toggleLog(on){
   // 顶栏「设置 / 日志」: 打开右侧设置抽屉(运行日志在抽屉底部)
   toggleDrawer(!!on);
+}
+function openPlayer(){
+  // 离线播放器是独立页面, 开新标签, 这样面板的 SSE 不会被视频占满带宽拖慢
+  window.open("/player", "_blank", "noopener");
 }
 async function openWhat(what, id){
   const j = await api("/api/open", {what, id});
