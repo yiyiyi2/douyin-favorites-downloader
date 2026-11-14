@@ -420,6 +420,17 @@
     <div class="val" id="gapHint" style="color:#8a94a6;font-size:11px;margin-top:6px"></div>
   </div>
   <div class="field">
+    <label>下载连接数 <span style="color:#8a94a6;font-weight:400;font-size:11px">（大文件切成多份同时下，明显更快；0 或 1 = 单连接）</span></label>
+    <div style="display:flex;gap:8px;align-items:center">
+      <input id="workersInput" type="number" min="0" max="16" step="1" value="8"
+             style="width:90px;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px/1.4 Consolas,monospace"
+             spellcheck="false">
+      <span style="color:#8a94a6;font-size:11px">路（0~16，默认 8）</span>
+      <button id="workersSave" onclick="saveWorkers()">保存</button>
+    </div>
+    <div class="val" id="workersHint" style="color:#8a94a6;font-size:11px;margin-top:6px"></div>
+  </div>
+  <div class="field">
     <label>下载目录 <span style="color:#8a94a6;font-weight:400;font-size:11px">（改成其他盘/文件夹后，新视频就存那里）</span></label>
     <div style="display:flex;gap:8px">
       <input id="outdirInput" style="flex:1;background:var(--panel-2);border:1px solid var(--line);border-radius:8px;color:var(--txt);padding:7px 10px;font:12px/1.4 Consolas,monospace" spellcheck="false">
@@ -732,6 +743,8 @@ function render(){
     if(gh) gh.textContent = !STATE.auto_rec ? "（自动下推荐开着时才生效）"
                         : (STATE.auto_adv ? `当前每 ${Math.round(STATE.auto_gap||3)} 秒翻一条` : "（自动翻页已关，不会主动滑页面）");
   }
+  // 下载连接数(分段并发)
+  renderWorkers();
   // 「自动下载推荐页视频」单选状态
   {
     const on = STATE.auto_rec ? 1 : 0;
@@ -861,6 +874,33 @@ async function saveGap(){
   if(!j.ok) return;
   if(STATE) STATE.auto_gap = v;
   toast(`翻页间隔已设为 ${v} 秒`, v <= 5 ? "节奏较快，注意别把页面刷崩" : "慢一点更稳，磁盘压力也小");
+}
+
+// 设置: 下载连接数(分段并发)。0/1 = 关掉并发走单连接。
+async function saveWorkers(){
+  const el = $("workersInput");
+  let v = parseInt(el && el.value, 10);
+  if(!Number.isFinite(v)) v = 8;
+  v = Math.max(0, Math.min(16, v));
+  if(el) el.value = v;
+  const j = await api("/api/settings", {dl_workers: v});
+  if(!j.ok) return;
+  if(STATE) STATE.dl_workers = v;
+  renderWorkers();
+  toast(v > 1 ? `连接数已设为 ${v} 路` : "已关闭分段并发，改回单连接",
+        v > 1 ? "大文件会更快，小文件不受影响" : "网络不稳或 CDN 限制时更保守");
+}
+
+function renderWorkers(){
+  const n = (STATE && STATE.dl_workers) != null ? STATE.dl_workers : 8;
+  const inp = $("workersInput");
+  if(inp && document.activeElement !== inp) inp.value = n;
+  const hint = $("workersHint");
+  if(hint){
+    hint.textContent = n > 1
+      ? `当前 ${n} 路并发：大于 8MB 的文件会切成 ${n} 段同时下载，实测能快数倍`
+      : "当前单连接下载：速度受单条连接限制，但最不挑网络环境";
+  }
 }
 
 // 右键菜单

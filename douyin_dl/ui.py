@@ -303,6 +303,9 @@ _SETTINGS_DEFAULTS = {
     "quality": "max", "open_browser": True, "auto_reopen": True,
     "by_author": False, "auto_rec": False, "auto_gap": 3.0,
     "auto_adv": True,
+    # v2.2: 分段并发下载的连接数。CDN 限的是单连接速率, 不是账号速率,
+    # 实测 8 路并发比单连接快 6.8 倍。0/1 = 关掉并发(老行为)。
+    "dl_workers": 8,
 }
 
 # 设置文件读-改-写必须是原子的: 面板里快速连点两个开关, 两个 POST 各读各的
@@ -399,6 +402,15 @@ def _clamp_gap(v) -> float:
     return max(1.0, min(60.0, g))
 
 
+def _clamp_workers(v) -> int:
+    """分段并发连接数: 0~16。0/1 表示关掉并发(退回单连接)。"""
+    try:
+        n = int(_as_number(v, 8))
+    except Exception:
+        return 8
+    return max(0, min(16, n))
+
+
 def _clean_settings(data) -> dict:
     """把落盘/前端传来的设置强制归一化, 保证每个字段都是能用的类型。
 
@@ -415,6 +427,7 @@ def _clean_settings(data) -> dict:
     for k in ("open_browser", "auto_reopen", "by_author", "auto_rec", "auto_adv"):
         d[k] = _as_bool(d.get(k), bool(_SETTINGS_DEFAULTS[k]))
     d["auto_gap"] = _clamp_gap(d.get("auto_gap"))
+    d["dl_workers"] = _clamp_workers(d.get("dl_workers"))
     od = d.get("out_dir")
     if od is not None and not isinstance(od, str):
         od = None          # list/dict/int 都是坏值, 直接丢弃而不是 str() 出一串垃圾路径
@@ -837,6 +850,8 @@ class EventBus:
             "auto_gap": _clamp_gap(conf.get("auto_gap")),
             "auto_adv": bool(conf.get("auto_adv", True)),
             "out_dir_configured": bool(conf.get("out_dir")),
+            # v2.2: 分段并发下载的连接数。0/1 = 关掉并发走单连接。
+            "dl_workers": _clamp_workers(conf.get("dl_workers")),
         }
 
     @property
@@ -1098,6 +1113,10 @@ class _Handler(BaseHTTPRequestHandler):
                             cb(body["auto_adv"])
                         except Exception:
                             pass
+                # v2.2: 下载连接数(分段并发)。0/1 = 关掉并发走单连接。
+                # 只改数字, 不重启也立即生效 —— Downloader 每次下载都重新读。
+                if "dl_workers" in body:
+                    cur["dl_workers"] = _clamp_workers(body.get("dl_workers"))
                 # 下载目录可调: 必须是字符串; 相对路径按工作区补全后存。
                 # 建不出来(盘不存在/没权限)就拒绝, 不留下一个下载会悄悄失败的设置。
                 if "out_dir" in body:

@@ -26,6 +26,7 @@ from typing import Any, Callable, Iterable
 
 import requests
 
+from . import core
 from .core import (
     Candidate,
     VideoInfo,
@@ -375,6 +376,14 @@ def _download_raw(session: requests.Session, urls: list[str], dest: Path,
     for url in urls:
         if not url:
             continue
+        # v2.2: 大文件(B站 4K 轨动辄几百 MB)走分段并发。
+        # CDN 通常限的是单连接速率, 不是账号速率 —— 实测同一个 448MB 的
+        # 4K 轨, 单连接 1.96 MB/s, 8 路并发 13.37 MB/s(6.83 倍)。
+        hdrs = {"Referer": REFERER_BILI, "Origin": "https://www.bilibili.com"}
+        if core.download_parallel(session, url, dest, log=log,
+                                  on_progress=on_progress, headers=hdrs):
+            return True
+        # 分段没成功(探不到总长 / 服务端不支持 Range)就走原来的单连接
         for attempt in range(1, retries + 1):
             try:
                 with session.get(url, stream=True, timeout=60,

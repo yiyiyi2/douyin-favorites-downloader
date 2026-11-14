@@ -414,12 +414,16 @@ def test_downloader_ks_full_path(tmp_path, monkeypatch):
     monkeypatch.setattr(mod, "probe_size", lambda session, url: 23089393)
     monkeypatch.setattr(mod, "verify_video", lambda dest: True)
 
-    def fake_download(session, url, dest, log=None, on_progress=None):
+    def fake_download(session, url, dest, log=None, on_progress=None,
+                      **kwargs):
         # 真 mp4 魔数, 让后续校验逻辑有意义
         dest.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 4096)
         return True
 
+    # v2.2: 单流下载改走 download_smart(大文件自动分段并发), 小文件最终还是
+    # 落到 download。两个都打桩。
     monkeypatch.setattr(mod, "download", fake_download)
+    monkeypatch.setattr(mod, "download_smart", fake_download)
 
     class FakeState:
         def __init__(self):
