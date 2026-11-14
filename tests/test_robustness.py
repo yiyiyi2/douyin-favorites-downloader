@@ -732,3 +732,48 @@ def test_hook_js_prefers_raw_report_binding():
     # HOOK_VER 必须两侧一致
     from douyin_dl.watcher import HOOK_VER
     assert f"const HOOK_VER = {HOOK_VER};" in HOOK_JS
+
+
+def test_ensure_raw_binding_passes_tid_to_worker_thread():
+    """v1.7.2 的回归: _ensure_raw_binding 起线程必须传 args=(tid,)。
+
+    曾经漏写 args 导致 _raw_binding_worker() missing 1 required positional
+    argument: 'tid', raw 通道线程一启动就崩, 半死页收藏事件永远传不回来。
+    这里用假 Thread 抓取传给 target 的参数, 锁定这个契约。
+    """
+    w = _make_watcher()
+    tid = "B5E843C5DE7E9B90784F66F0F5F61340"
+
+    class _Page:
+        pass
+
+    captured = {}
+
+    class _FakeThread:
+        def __init__(self, target=None, args=(), name="", daemon=None):
+            captured["target"] = target
+            captured["args"] = args
+            captured["name"] = name
+            captured["daemon"] = daemon
+        def start(self):
+            captured["started"] = True
+        def is_alive(self):
+            return False
+
+    w._page_debugger_id = lambda page: tid
+    import threading as _th
+    orig = _th.Thread
+    try:
+        _th.Thread = _FakeThread
+        assert w._ensure_raw_binding(_Page()) is True
+    finally:
+        _th.Thread = orig
+
+    # 核心契约: 线程 target 是 _raw_binding_worker, 且 args 恰好是 (tid,)
+    assert captured.get("target") == w._raw_binding_worker
+    assert captured.get("args") == (tid,)
+    assert captured.get("started") is True
+    # 名字里带 targetId 前 8 位, 便于排查
+    assert captured.get("name") == f"dy-raw-{tid[:8]}"
+    # 注册表里已记录该线程
+    assert w._raw_workers.get(tid) is not None

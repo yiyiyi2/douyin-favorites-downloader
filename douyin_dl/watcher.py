@@ -2323,7 +2323,7 @@ class BrowserWatcher:
             t = self._raw_workers.get(tid)
             if t is not None and t.is_alive():
                 return True
-        t = threading.Thread(target=self._raw_binding_worker,
+        t = threading.Thread(target=self._raw_binding_worker, args=(tid,),
                              name=f"dy-raw-{tid[:8]}", daemon=True)
         with self._raw_lock:
             self._raw_workers[tid] = t
