@@ -2297,6 +2297,14 @@ class BrowserWatcher:
                                          (msg.get("params") or {}).get("payload") or "")
                 if 1 in got and 2 in got:
                     break
+            # 握手阶段靠 recv 的 4s 超时 + deadline 兜底; 握手完成后必须把
+            # socket 超时关掉, 否则空闲 4 秒 recv() 就抛 WebSocketTimeoutException
+            # 被外层 except 吞掉 -> 线程 4 秒后静默死亡 -> raw 通道断开(事件丢失)。
+            # 建连成功后 recv() 应无限阻塞, 只靠 _hook_all_pages 每 6 秒巡检重建。
+            try:
+                conn.settimeout(None)
+            except Exception:
+                pass
             # 事件循环
             while True:
                 msg = json.loads(conn.recv())

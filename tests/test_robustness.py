@@ -828,3 +828,72 @@ def test_hook_all_pages_covers_orphan_halfdead_page_via_cdp():
     assert calls["ensure_raw"] == 1
     assert calls["cdp_eval"] == 1
     assert calls["raw_inject"] == 1        # HOOK_JS 通过纯 CDP 注入孤儿页
+
+
+def test_raw_binding_worker_disables_recv_timeout_after_handshake():
+    """v1.7.3 回归: 握手完成后必须 conn.settimeout(None)。
+
+    曾经建连时 timeout=4s 一直沿用, 事件循环里 conn.recv() 空闲 4 秒就抛
+    WebSocketTimeoutException -> 被 except 吞掉 -> 线程静默死亡 -> raw 通道断开,
+    快手收藏事件全部丢失。这里锁定: 收到 id 1/2 两个响应后、进入事件循环前,
+    必须把 socket 超时关掉, 让 recv() 无限阻塞。
+    """
+    import threading as _th
+    w = _make_watcher()
+    tid = "ED1A707AA26C07E7C89EF19F0372AE66"
+
+    state = {"settimeout_calls": [], "recv_after_settimeout": 0}
+
+    class _FakeConn:
+        def __init__(self):
+            self._recv_i = 0
+        def send(self, _s):
+            pass
+        def recv(self):
+            self._recv_i += 1
+            # 握手阶段: 先回 id=1, 再回 id=2
+            if self._recv_i == 1:
+                return '{"id":1,"result":{}}'
+            if self._recv_i == 2:
+                return '{"id":2,"result":{}}'
+            # 进入事件循环后第一次 recv 就抛异常, 模拟连接断开让线程退出
+            raise RuntimeError("conn dropped for test")
+        def settimeout(self, v):
+            state["settimeout_calls"].append(v)
+        def close(self):
+            pass
+
+    import websocket as _wsmod
+    orig_create = _wsmod.create_connection
+
+    def _fake_create(ws_url, timeout=None, enable_multithread=None):
+        assert timeout is not None and timeout > 0
+        return _FakeConn()
+
+    # 把 urllib.request.urlopen 也假掉, 让它返回含 webSocketDebuggerUrl 的 /json/list
+    import urllib.request as _ur, json as _json
+    class _Resp:
+        def read(self):
+            return _json.dumps([{"id": tid, "type": "page",
+                                 "url": "https://www.kuaishou.com/new-reco",
+                                 "webSocketDebuggerUrl": "ws://x"}]).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    orig_urlopen = _ur.urlopen
+    try:
+        _ur.urlopen = lambda *a, **k: _Resp()
+        _wsmod.create_connection = _fake_create
+        t = _th.Thread(target=w._raw_binding_worker, args=(tid,), daemon=True)
+        t.start()
+        t.join(timeout=5)
+    finally:
+        _ur.urlopen = orig_urlopen
+        _wsmod.create_connection = orig_create
+
+    # 核心契约: 进入事件循环前把超时关掉
+    assert state["settimeout_calls"] == [None], state
+    # 线程应已退出(recv 抛异常被 finally 清理), 且从注册表摘除
+    assert not t.is_alive()
