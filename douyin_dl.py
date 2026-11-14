@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-抖音收藏自动下载 —— 主程序
+抖音 / 快手 / B站收藏自动下载 —— 主程序
 
 用法:
     python douyin_dl.py                 # 启动, 然后去抖音点收藏
@@ -924,7 +924,7 @@ def main():
     global _LOCK
 
     ap = argparse.ArgumentParser(
-        description="抖音收藏自动下载(最高画质 / 无水印)",
+        description="抖音 / 快手 / B站收藏自动下载(最高画质 / 无水印)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     ap.add_argument("--url", help="只下载指定链接, 不启动监听")
@@ -969,7 +969,7 @@ def main():
     session = build_session()
 
     log("=" * 62)
-    log("  抖音收藏自动下载  |  最高画质 · 无水印")
+    log("  抖音 / 快手 / B站收藏自动下载  |  最高画质 · 无水印")
     log("=" * 62)
     log(f"  工作区: {WORKSPACE}")
     log(f"  输出到: {OUT_DIR}")
