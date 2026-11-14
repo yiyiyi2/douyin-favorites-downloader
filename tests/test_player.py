@@ -153,6 +153,26 @@ def test_player_grid_card_does_not_use_aspect_ratio():
     assert "padding-bottom" in body
 
 
+def test_player_rail_does_not_double_offset_for_grid():
+    """v2.3.1 回归: .slide 内部的控件不能再用 --goff 偏移。
+
+    #stage 已经用 right:var(--goff) 给右侧网格让出了位置, 而 .rail/.meta/.bar
+    都在 .slide 里(在 #stage 内部)。如果它们再加一次 --goff, 打开网格时就被
+    推两次, 点赞栏跑到视频中间去。这条锁住"slide 内部不吃 --goff"。
+    """
+    body = _player_src()
+    body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)   # 先剥注释, 免得命中说明文字
+    for sel in (r"\.rail\s*\{[^}]*\}", r"\.meta\s*\{[^}]*\}", r"\.bar\s*\{[^}]*\}"):
+        m = re.search(sel, body)
+        assert m, f"没找到样式 {sel}"
+        assert "--goff" not in m.group(0), (
+            f"{sel} 里又出现了 --goff, 打开网格时会被偏移两次: {m.group(0)}")
+    # 而 #stage/.top 是必须吃 --goff 的, 别一起改坏了
+    for sel in (r"#stage\s*\{[^}]*\}", r"\.top\s*\{[^}]*\}"):
+        m = re.search(sel, body)
+        assert m and "--goff" in m.group(0), f"{sel} 应该继续用 --goff 给网格让位"
+
+
 def test_player_card_overlay_ignores_pointer():
     """卡片上的角标/文案必须 pointer-events:none, 否则点击被它们截走。"""
     t = _player_src()

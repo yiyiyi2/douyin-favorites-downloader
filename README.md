@@ -1,8 +1,8 @@
-# 抖音 / 快手 / B站收藏自动下载 · v2.3
+# 抖音 / 快手 / B站收藏自动下载 · v2.3.1
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-2.3.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.3.1-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -167,6 +167,21 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.3.1
+
+**主题：修「打开右侧 3×N 网格后，点赞/收藏栏跑到视频中间」。**
+
+- **根因**：`#stage` 用 `right:var(--goff)` 已经给网格让出了 286px，而 `.rail`
+  （点赞/收藏/评论/分享）、`.meta`（作者/文案）、`.bar`（进度条）都写在 `.slide`
+  里面、是 `#stage` 的子元素，却各自又加了一次 `var(--goff)` → 被推了两次，
+  正好挪到视频中间。`.top`（顶栏）是 `#stage` 的兄弟节点，只吃一次才是对的。
+- **修法**：`.rail` 改 `right:12px`、`.meta` 改 `right:92px`、`.bar` 改 `right:0`，
+  不再吃 `--goff`；`.top` 与 `#stage` 保持原样。
+- **实测**（真 Chromium 1440×900）：网格展开时视频区 0~1154、点赞栏右边缘 1142
+  （贴边 12px）；折叠时视频区 0~1440、点赞栏 1428。两种状态都贴在网格一侧。
+- **回归测试**：新增 1 例静态约束（slide 内部三个控件不许出现 `--goff`，而
+  `#stage`/`.top` 必须继续有），全量 **343 passed**。
 
 ## v2.3
 

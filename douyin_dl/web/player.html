@@ -53,8 +53,11 @@
   .glass svg{width:74px;height:74px;filter:drop-shadow(0 2px 12px rgba(0,0,0,.7));opacity:.9}
 
   /* ---------- 右侧操作栏 ---------- */
+  /* 注意: .rail/.meta/.bar 都在 .slide 里, 而 #stage 已经用
+     right:var(--goff) 给网格让出了位置。这里千万不能再加 --goff,
+     否则打开网格时会被推两次、跑到视频中间去。 */
   .rail{
-    position:absolute;right:calc(12px + var(--goff));bottom:118px;display:flex;flex-direction:column;
+    position:absolute;right:12px;bottom:118px;display:flex;flex-direction:column;
     gap:20px;align-items:center;z-index:6;
     transition:right .26s cubic-bezier(.4,0,.2,1);
   }
@@ -80,7 +83,7 @@
 
   /* ---------- 左下信息 ---------- */
   .meta{
-    position:absolute;left:14px;right:calc(92px + var(--goff));bottom:72px;z-index:6;
+    position:absolute;left:14px;right:92px;bottom:72px;z-index:6;
     text-shadow:0 1px 8px rgba(0,0,0,.95);pointer-events:none;
     transition:right .26s cubic-bezier(.4,0,.2,1);
   }
@@ -113,7 +116,7 @@
 
   /* ---------- 进度条 ---------- */
   .bar{
-    position:absolute;left:0;right:var(--goff);bottom:0;height:22px;z-index:8;
+    position:absolute;left:0;right:0;bottom:0;height:22px;z-index:8;
     display:flex;align-items:flex-end;cursor:pointer;padding-bottom:2px;
     transition:right .26s cubic-bezier(.4,0,.2,1);
   }
