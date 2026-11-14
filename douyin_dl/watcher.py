@@ -70,12 +70,12 @@ def _cap_set(s: set, limit: int) -> int:
 # writable —— 否则抛 "Invalid property descriptor", 钩子会静默失效。
 # 这个坑踩过一次, 这里保持正确写法。
 # ---------------------------------------------------------------------------
-HOOK_VER = 10   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
+HOOK_VER = 11   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
 
 HOOK_JS = r"""
 (() => {
   // 版本号: 改动钩子逻辑就 +1, 否则页面里的旧版本会靠守卫把新版本挡掉(踩过坑)
-  const HOOK_VER = 10;
+  const HOOK_VER = 11;
   if (window.__DY_HOOK_VER__ === HOOK_VER) return;
   // 需要搭便车的接口
   const DATA_EP = [
@@ -226,14 +226,21 @@ HOOK_JS = r"""
         kind = "oversize";
         text = "";
       }
-      if (typeof window.__dyReport !== "function") return;
-      window.__dyReport(JSON.stringify({
+      // v1.7.2: 半死页(快手 new-reco)的 Playwright expose_binding 通道会断,
+      // 但 raw CDP Runtime.addBinding 注入的 __dyReportRaw 走独立 websocket,
+      // 依然有效。优先走 raw 通道, 不行再退回 expose_binding。
+      const payload = JSON.stringify({
         kind: kind, url: url, body: text || "", req: reqBody || "",
         href: location.href,
         favAt: window.__dyFavAt || 0,
         favIds: window.__dyFavIds || [],
         favTs: window.__dyFavTs || {},
-      }));
+      });
+      if (typeof window.__dyReportRaw === "function") {
+        try { window.__dyReportRaw(payload); return; } catch (e) {}
+      }
+      if (typeof window.__dyReport !== "function") return;
+      window.__dyReport(payload);
     } catch (e) {}
   };
 
@@ -824,6 +831,12 @@ class BrowserWatcher:
         # v1.7.1: 坏页面拉黑表 {url: 解禁时间戳} + 它的锁
         self._bad_pages: dict[str, float] = {}
         self._hook_lock = threading.Lock()
+        # v1.7.2: raw CDP binding 回传通道。快手 new-reco 页在 Playwright 侧会
+        # 变「半死页」(page.url 空、page.evaluate 永久挂), expose_binding 的
+        # __dyReport 通道也断; 但 raw CDP Runtime.addBinding 走独立 websocket,
+        # 不经过 Playwright attach, 对半死页依然有效。这里存 {targetId: worker 线程}。
+        self._raw_lock = threading.Lock()
+        self._raw_workers: dict[str, threading.Thread] = {}
         self._page = None
         self._ctx = None
         self._browser = None
@@ -2100,11 +2113,33 @@ class BrowserWatcher:
     _BLACKLIST_SECS = 120.0     # 探活失败后拉黑多久
 
     def _page_url(self, page):
-        """拿页面 URL, 拿不到就返回空串(某些坏页连 .url 都会抛)。"""
+        """拿页面 URL, 拿不到就返回空串(某些坏页连 .url 都会抛)。
+
+        v1.7.2: Playwright 侧 page.url 为空但页面其实还活着的「半死页」
+        (典型是快手 new-reco 页)会在这里漏判成非站点页, 导致钩子装不上、
+        收藏事件全部丢失。所以 page.url 为空时用 CDP Target.getTargetInfo
+        再问一次真实 URL。
+        """
         try:
-            return page.url or ""
+            url = page.url or ""
+        except Exception:
+            url = ""
+        if url:
+            return url
+        # page.url 空: 可能是半死页。CDP 层通常还活着, 拿真实 URL。
+        tid = self._page_debugger_id(page)
+        if not tid:
+            return ""
+        try:
+            tabs = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/list",
+                timeout=self._PROBE_TIMEOUT).read())
+            for t in tabs:
+                if isinstance(t, dict) and t.get("id") == tid:
+                    return t.get("url") or ""
         except Exception:
             return ""
+        return ""
 
     def _is_site_url(self, url):
         """只有真正的抖音/快手页面才值得装钩子。"""
@@ -2174,12 +2209,149 @@ class BrowserWatcher:
         except Exception:
             return None
 
+    def _raw_cdp(self, tid, method, params=None, timeout=6.0):
+        """对某个 target 做一次独立 CDP 往返(不走 Playwright attach)。"""
+        try:
+            import websocket as _ws
+        except Exception:
+            return None
+        try:
+            tabs = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/list",
+                timeout=self._PROBE_TIMEOUT).read())
+            ws_url = next((t.get("webSocketDebuggerUrl") for t in tabs
+                           if isinstance(t, dict) and t.get("id") == tid), None)
+            if not ws_url:
+                return None
+            conn = _ws.create_connection(ws_url, timeout=timeout,
+                                         enable_multithread=True)
+            try:
+                conn.send(json.dumps({"id": 1, "method": method,
+                                      "params": params or {}}))
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    msg = json.loads(conn.recv())
+                    if msg.get("id") == 1:
+                        return msg.get("result")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            return None
+        return None
+
+    def _raw_binding_worker(self, tid: str):
+        """给一个 target 开一条独立的 raw CDP binding 通道。
+
+        用 websocket 直连 CDP, Runtime.addBinding 注册 __dyReportRaw,
+        收到 Runtime.bindingCalled 就把 payload 当 binding 事件入队
+        (和 expose_binding 的 _on_binding 走同一条 queue, 主循环 drain 处理)。
+        这条通道不经过 Playwright 的 attach, 所以对「半死页」(page.evaluate
+        挂起、expose_binding 断)依然有效。
+        """
+        try:
+            import websocket as _ws
+        except Exception:
+            return
+        ws_url = None
+        try:
+            tabs = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/list",
+                timeout=self._PROBE_TIMEOUT).read())
+            ws_url = next((t.get("webSocketDebuggerUrl") for t in tabs
+                           if isinstance(t, dict) and t.get("id") == tid), None)
+        except Exception:
+            ws_url = None
+        if not ws_url:
+            return
+        conn = None
+        try:
+            conn = _ws.create_connection(ws_url, timeout=self._PROBE_TIMEOUT,
+                                         enable_multithread=True)
+            conn.send(json.dumps({"id": 1, "method": "Runtime.enable",
+                                  "params": {}}))
+            conn.send(json.dumps({"id": 2, "method": "Runtime.addBinding",
+                                  "params": {"name": "__dyReportRaw"}}))
+            # 先收掉两个 id 的响应, 之后就是 bindingCalled 事件流
+            got = set()
+            deadline = time.time() + self._PROBE_TIMEOUT
+            while time.time() < deadline:
+                msg = json.loads(conn.recv())
+                if msg.get("id") in (1, 2):
+                    got.add(msg.get("id"))
+                if msg.get("method") == "Runtime.bindingCalled":
+                    name = (msg.get("params") or {}).get("name")
+                    if name == "__dyReportRaw":
+                        self._on_binding("__dyReportRaw",
+                                         (msg.get("params") or {}).get("payload") or "")
+                if 1 in got and 2 in got:
+                    break
+            # 事件循环
+            while True:
+                msg = json.loads(conn.recv())
+                if msg.get("method") == "Runtime.bindingCalled":
+                    name = (msg.get("params") or {}).get("name")
+                    if name == "__dyReportRaw":
+                        self._on_binding("__dyReportRaw",
+                                         (msg.get("params") or {}).get("payload") or "")
+        except Exception:
+            pass
+        finally:
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            # 线程退出时把自己从注册表摘掉
+            with self._raw_lock:
+                if self._raw_workers.get(tid) is threading.current_thread():
+                    self._raw_workers.pop(tid, None)
+
+    def _ensure_raw_binding(self, page) -> bool:
+        """确保某个 target 有 raw CDP binding 通道在跑。返回是否已就绪。
+
+        关键: Runtime.addBinding 只在「同一条 websocket 连接」存活期间有效,
+        所以必须由 _raw_binding_worker 的长连接来做, 不能用 _raw_cdp 那种
+        发完就关的短连接(短连接一关 binding 就失效)。
+        """
+        tid = self._page_debugger_id(page)
+        if not tid:
+            return False
+        with self._raw_lock:
+            t = self._raw_workers.get(tid)
+            if t is not None and t.is_alive():
+                return True
+        t = threading.Thread(target=self._raw_binding_worker,
+                             name=f"dy-raw-{tid[:8]}", daemon=True)
+        with self._raw_lock:
+            self._raw_workers[tid] = t
+        t.start()
+        return True
+
+    def _cdp_eval(self, tid, expression):
+        """用独立 CDP 对某个 target 做一次 evaluate(半死页也能用)。"""
+        r = self._raw_cdp(tid, "Runtime.evaluate",
+                          {"expression": expression, "returnByValue": True},
+                          timeout=6.0)
+        if not isinstance(r, dict):
+            return None
+        result = r.get("result")
+        if not isinstance(result, dict):
+            return None
+        return result.get("value")
+
     def _install_hook(self, page):
         """给一个页面装钩子。返回 True 表示确定装好了(或本来就好)。
 
         v1.7.1: 对空 URL / 非站点页直接跳过 —— 这类页面(典型是切站点时渲染进程
         挂掉留下的空壳)调 page.evaluate 会永久阻塞, 把主循环钉死。已经拉黑的
         页面也不再碰。
+
+        v1.7.2: 「半死页」(page.url 空、page.evaluate 永久挂起, 但 CDP 层还活着,
+        典型是快手 new-reco 页)改用独立 CDP 注入钩子 + raw binding 通道回传,
+        这样快手收藏事件不再因为 Playwright attach 断裂而丢失。
         """
         url = self._page_url(page)
         if not self._is_site_url(url):
@@ -2191,7 +2363,28 @@ class BrowserWatcher:
         if not self._page_alive(page):
             self._blacklist(url, "探活无响应")
             return False
-        # 页面正在跳转时 evaluate 会抛 "Execution context was destroyed", 属正常, 下一轮再装
+
+        # v1.7.2: 判断是不是「半死页」—— CDP 能探活但 Playwright 的 url 是空。
+        # 这种页绝不能走 page.evaluate(会挂起), 改走独立 CDP 注入。
+        try:
+            pw_url = page.url or ""
+        except Exception:
+            pw_url = ""
+        tid = self._page_debugger_id(page)
+        if not pw_url and tid:
+            # 半死页: 先建 raw binding 通道(让 window.__dyReportRaw 就绪),
+            # 再用 CDP 注入钩子, 这样 send() 一注入就能走 raw 通道回传。
+            self._ensure_raw_binding(page)
+            ver = self._cdp_eval(tid, "window.__DY_HOOK_VER__ || 0")
+            if ver != HOOK_VER:
+                self._raw_cdp(tid, "Runtime.evaluate",
+                              {"expression": HOOK_JS}, timeout=8.0)
+            self._hook_ok = True
+            self._unblacklist(url)
+            self.log(f"  · 半死页用 raw 通道注入钩子: {url[:50]}")
+            return True
+
+        # 正常页: 走 Playwright evaluate(快、可靠)
         for _ in range(2):
             try:
                 if page.evaluate("() => window.__DY_HOOK_VER__ || 0") != HOOK_VER:

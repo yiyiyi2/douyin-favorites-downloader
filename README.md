@@ -1,8 +1,8 @@
-# 抖音 / 快手收藏自动下载 · v1.7.1
+# 抖音 / 快手收藏自动下载 · v1.7.2
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-1.7.1-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-1.7.2-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -165,6 +165,23 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v1.7.2
+
+**主题：修「快手收藏点不动」—— 半死页改用独立 CDP 通道回传事件。**
+
+- **根因**：快手 `new-reco` 页在 Playwright 驱动侧是「半死页」—— CDP 层还活着、
+  渲染进程也活着，但 Playwright 对这个页面的 attach 断了：`page.url` 读成空串，
+  `page.evaluate` 永久挂起，更关键的是 `expose_binding` 注入的 `__dyReport` 回传
+  通道断裂，所以收藏事件**根本传不回来**（日志里连「检测到收藏点击」都没有）
+- **raw CDP 通道**：新增独立 websocket 长连接 + `Runtime.addBinding("__dyReportRaw")`，
+  后台线程收 `Runtime.bindingCalled` 事件直接入队，完全不经过 Playwright attach；
+  HOOK_JS 的 `send()` 优先走这条通道，走不通才退回旧的 `expose_binding`
+- **半死页识别**：`page.url` 为空时用 CDP `Target.getTargetInfo` 再问一次真实 URL，
+  认出来是站点页就不再误判成「非站点页」跳过；装钩子时对半死页改走 CDP `Runtime.evaluate`
+  注入（带硬超时），绝不碰会挂起的 `page.evaluate`
+- **回归测试**：新增 3 例（半死页 URL 兜底 / 半死页走 raw 通道不 evaluate / HOOK_JS
+  优先 raw 通道），全量 237 例通过
 
 ## v1.7.1
 

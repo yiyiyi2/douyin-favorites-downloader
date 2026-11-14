@@ -82,7 +82,8 @@ def main():
 
             # 1) 钩子装上, 两侧版本号一致
             ver = page.evaluate("window.__DY_HOOK_VER__")
-            results.append(("hook version installed", ver == 10, ver))
+            from douyin_dl.watcher import HOOK_VER
+            results.append(("hook version installed", ver == HOOK_VER, ver))
             results.append(("hooked flag",
                             page.evaluate("window.__DY_HOOKED_V2__ === true"), ""))
             # 2) fetch 被替换且页面覆盖不掉(历史上 writable 描述符踩过大坑)

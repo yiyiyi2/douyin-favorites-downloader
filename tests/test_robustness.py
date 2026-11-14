@@ -591,7 +591,8 @@ def test_install_hook_unblacklists_after_success():
         url = site_url
         def evaluate(self, js=None, *_a, **_k):
             if js == "() => window.__DY_HOOK_VER__ || 0":
-                return 10                      # 与 HOOK_VER 相等, 不重装
+                from douyin_dl.watcher import HOOK_VER
+                return HOOK_VER                  # 与 HOOK_VER 相等, 不重装
             raise AssertionError("不该再装 HOOK_JS")
     assert w._install_hook(_GoodSite()) is True
     assert w._page_blacklisted(site_url) is False
@@ -660,3 +661,74 @@ def test_pump_falls_back_to_browser_cdp_when_no_site_page():
     w._browser = _Browser()
     w.pump(_Ctx())
     assert got["version"] is True
+
+
+# ---------------------------------------------------------------------------
+# 7. v1.7.2: 半死页 (page.url 空但 CDP 层活着) 的 raw 通道
+# ---------------------------------------------------------------------------
+def test_page_url_falls_back_to_cdp_for_halfdead_page():
+    """page.url 空时, 用 CDP Target.getTargetInfo 拿真实 URL, 识别出站点页。"""
+    w = _make_watcher()
+    w._ctx = object()
+    tid = "56B9D255FA6F"
+
+    class _HalfDead:
+        url = ""
+
+    w._page_debugger_id = lambda page: tid
+    import urllib.request as _ur, json as _json
+    orig = _ur.urlopen
+    class _Resp:
+        def read(self):
+            return _json.dumps([{"id": tid, "url": "https://www.kuaishou.com/new-reco"}]).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    try:
+        _ur.urlopen = lambda *a, **k: _Resp()
+        assert w._page_url(_HalfDead()) == "https://www.kuaishou.com/new-reco"
+    finally:
+        _ur.urlopen = orig
+
+
+def test_install_hook_halfdead_page_uses_raw_channel_not_evaluate():
+    """半死页(站点 URL 但 Playwright url 空)走 CDP 注入 + raw binding, 绝不 evaluate。"""
+    w = _make_watcher()
+    w._ctx = object()
+    site_url = "https://www.kuaishou.com/new-reco"
+    tid = "56B9D255FA6F"
+
+    class _HalfDead:
+        url = ""
+        def evaluate(self, *_a, **_k):
+            raise AssertionError("半死页绝不走 page.evaluate")
+
+    w._page_alive = lambda page: True
+    w._page_debugger_id = lambda page: tid
+    # _page_url 对半死页也要能拿到站点 URL(走 CDP 兜底), 这里直接给真实 URL
+    w._page_url = lambda page: site_url
+    calls = {"cdp_eval": 0, "raw_inject": 0, "ensure_raw": 0}
+    w._cdp_eval = lambda tid, expr: (calls.__setitem__("cdp_eval", calls["cdp_eval"] + 1) or 0)
+    def _raw_cdp(tid_, method, params=None, timeout=6.0):
+        if method == "Runtime.evaluate":
+            calls["raw_inject"] += 1
+        return {}
+    w._raw_cdp = _raw_cdp
+    w._ensure_raw_binding = lambda page: (calls.__setitem__("ensure_raw", calls["ensure_raw"] + 1) or True)
+
+    assert w._install_hook(_HalfDead()) is True
+    assert calls["ensure_raw"] == 1
+    assert calls["cdp_eval"] == 1
+    assert calls["raw_inject"] == 1      # HOOK_JS 通过 CDP 注入
+
+
+def test_hook_js_prefers_raw_report_binding():
+    """HOOK_JS 的 send() 优先 __dyReportRaw, 半死页能走 raw 通道。"""
+    from douyin_dl.watcher import HOOK_JS
+    # send() 里先试 __dyReportRaw, 再退回 __dyReport
+    assert "__dyReportRaw" in HOOK_JS
+    assert "window.__dyReport(payload)" in HOOK_JS or "window.__dyReport(" in HOOK_JS
+    # HOOK_VER 必须两侧一致
+    from douyin_dl.watcher import HOOK_VER
+    assert f"const HOOK_VER = {HOOK_VER};" in HOOK_JS
