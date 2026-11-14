@@ -830,6 +830,68 @@ def test_hook_all_pages_covers_orphan_halfdead_page_via_cdp():
     assert calls["raw_inject"] == 1        # HOOK_JS 通过纯 CDP 注入孤儿页
 
 
+def test_hook_all_pages_falls_back_when_install_hook_silently_fails():
+    """v1.7.3 回归: 页在 ctx.pages 里、但 _install_hook 静默失败(拿不到 tid)时,
+    _hook_all_pages 不能因为它"进了 pages_by_tid"就跳过, 必须仍走纯 CDP 兜底。
+
+    这是"退出重进快手就下不了"的直接根因: 半死页在 Playwright 侧 attach 断,
+    _page_debugger_id(page) 抛异常被吞 -> _page_url 返空 -> _install_hook 静默
+    return False, 而旧补漏分支用 `if tid in pages_by_tid: continue` 把这种
+    "看似处理过、其实没装成"的页也跳过了。
+    """
+    w = _make_watcher()
+    tid = "02E3B7175EB536F685755B42215F4BF2"
+    site_url = "https://www.kuaishou.com/new-reco"
+
+    # 快手页在 ctx.pages 里(所以 pages_by_tid 会记到它), 但 _install_hook 静默失败
+    class _HalfDeadInPages:
+        url = ""                      # Playwright 侧拿不到 URL
+        def is_closed(self):
+            return False
+
+    class _Ctx:
+        pages = [_HalfDeadInPages()]
+
+    # _page_debugger_id 对半死页返回 None -> _install_hook 会静默 return False
+    w._page_debugger_id = lambda page: None
+    w._install_hook = lambda page: False
+
+    calls = {"probe": 0, "ensure_raw": 0, "cdp_eval": 0, "raw_inject": 0}
+    w._cdp_probe = lambda t: (calls.__setitem__("probe", calls["probe"] + 1) or True)
+    w._ensure_raw_binding_by_tid = lambda t: (calls.__setitem__("ensure_raw", calls["ensure_raw"] + 1) or True)
+    w._cdp_eval = lambda t, expr: (calls.__setitem__("cdp_eval", calls["cdp_eval"] + 1) or 0)
+    def _raw_cdp(t, method, params=None, timeout=6.0):
+        if method == "Runtime.evaluate":
+            calls["raw_inject"] += 1
+        return {}
+    w._raw_cdp = _raw_cdp
+
+    import urllib.request as _ur, json as _json
+    class _Resp:
+        def read(self):
+            return _json.dumps([
+                {"id": tid, "type": "page", "url": site_url,
+                 "webSocketDebuggerUrl": "ws://x"},
+            ]).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    orig = _ur.urlopen
+    try:
+        _ur.urlopen = lambda *a, **k: _Resp()
+        n = w._hook_all_pages(_Ctx())
+    finally:
+        _ur.urlopen = orig
+
+    # 步骤 1 里 _install_hook 返回 False 没记入 hooked_tids -> 兜底分支必须接管
+    assert n == 1
+    assert calls["probe"] == 1
+    assert calls["ensure_raw"] == 1
+    assert calls["cdp_eval"] == 1
+    assert calls["raw_inject"] == 1
+
+
 def test_raw_binding_worker_disables_recv_timeout_after_handshake():
     """v1.7.3 回归: 握手完成后必须 conn.settimeout(None)。
 

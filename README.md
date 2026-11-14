@@ -1,8 +1,8 @@
-# 抖音 / 快手收藏自动下载 · v1.7.3
+# 抖音 / 快手收藏自动下载 · v1.7.4
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-1.7.3-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-1.7.4-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -165,6 +165,26 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v1.7.4
+
+**主题：修「退出再重进，快手就下不了」—— 补漏分支别再跳过"看着处理过其实没装成"的页。**
+
+- **根因**：v1.7.3 加了"孤儿半死页"补漏，但判断用的是
+  `if tid in pages_by_tid: continue` —— 只要这个 target 在 Playwright 的
+  `ctx.pages` 里出现过，就认为"已经处理过"。而快手 `new-reco` 页恰恰是
+  **在 `ctx.pages` 里、但 attach 已断**的半死页：`_page_debugger_id()` 抛异常
+  被吞 → `_page_url()` 拿到空串 → `_install_hook()` 认成"非站点页"静默
+  `return False`。步骤 1 没装成，步骤 2 又因为它"在列表里"跳过 →
+  钩子从来没装上、raw 通道从没建立，收藏事件全丢。抖音页 attach 一直正常，
+  所以只有快手出问题。
+- **修法**：`_hook_all_pages` 改用 `hooked_tids` 集合，**只记录步骤 1 真正
+  注入成功（`_install_hook` 返回 True）的 target**。步骤 2 只跳过这些，
+  其余站点页一律走纯 CDP 兜底（`_cdp_probe` 探活 → 建 raw 通道 →
+  `Runtime.evaluate` 注入 HOOK_JS），不再假设"在 ctx.pages 里就等于装好了"。
+  兜底注入成功时日志会打 `· CDP 兜底注入钩子: <地址>`，便于现场确认。
+- **回归测试**：新增 1 例（页在 `ctx.pages` 里但 `_install_hook` 静默失败时，
+  兜底分支仍必须接管），全量 241 例通过。
 
 ## v1.7.3
 

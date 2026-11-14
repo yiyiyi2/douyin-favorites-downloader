@@ -2458,6 +2458,7 @@ class BrowserWatcher:
         拿全部 page target, 对 Playwright 漏掉的站点页走纯 CDP 注入 + raw 通道。
         """
         n = 0
+        hooked_tids = set()
         # 1) 正常可见页走 Playwright evaluate(快、可靠)
         for pg in list(ctx.pages):
             try:
@@ -2467,22 +2468,25 @@ class BrowserWatcher:
                 continue
             try:
                 if self._install_hook(pg):
+                    try:
+                        tid = self._page_debugger_id(pg)
+                    except Exception:
+                        tid = None
+                    if tid:
+                        hooked_tids.add(tid)
                     n += 1
             except Exception:
                 pass
-        # 2) 补漏: CDP 层里 Playwright 看不见的站点页
+        # 2) 兜底: 用纯 CDP 给所有站点页装钩子。Playwright 对「半死页」的 page
+        #    对象不可靠 —— _page_url 的 CDP 兜底可能因 new_cdp_session 抛异常而
+        #    拿不到 tid, _install_hook 就静默 return False; 也有「从打开起 attach
+        #    就失败、根本不在 ctx.pages」的孤儿页。这两种都只能在 /json/list 里
+        #    按 tid 直连 CDP 才能装上。所以这里只跳过「步骤 1 已确认装好」的 tid,
+        #    其余站点页一律走纯 CDP 兜底, 不再假设 ctx.pages 里处理过就一定成功。
         try:
             tabs = json.loads(urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/json/list",
                 timeout=self._PROBE_TIMEOUT).read())
-            pages_by_tid = {}
-            for pg in list(ctx.pages):
-                try:
-                    tid = self._page_debugger_id(pg)
-                except Exception:
-                    tid = None
-                if tid:
-                    pages_by_tid[tid] = pg
             for t in tabs:
                 if not isinstance(t, dict) or t.get("type") != "page":
                     continue
@@ -2490,9 +2494,8 @@ class BrowserWatcher:
                 url = t.get("url") or ""
                 if not tid or not self._is_site_url(url):
                     continue
-                if tid in pages_by_tid:
-                    continue  # 已经由 _install_hook 处理过
-                # Playwright 看不见的站点页: 直接按 tid 走纯 CDP 通道
+                if tid in hooked_tids:
+                    continue  # 步骤 1 已经确认装好
                 if self._page_blacklisted(url):
                     continue
                 if not self._cdp_probe(tid):
@@ -2504,9 +2507,9 @@ class BrowserWatcher:
                     if ver != HOOK_VER:
                         self._raw_cdp(tid, "Runtime.evaluate",
                                       {"expression": HOOK_JS}, timeout=8.0)
+                        self.log(f"  · CDP 兜底注入钩子: {url[:50]}")
                     self._hook_ok = True
                     self._unblacklist(url)
-                    self.log(f"  · CDP 补漏注入钩子: {url[:50]}")
                     n += 1
                 except Exception:
                     pass
