@@ -121,6 +121,10 @@ class Candidate:
     size: int = 0
     gear_name: str = ""
     quality_key: str = ""
+    # --- 以下只有 B 站用得上（DASH 音视频分离，要下两路再合并）---
+    audio_url: str = ""          # 独立音频轨地址; 空 = 单流(抖音/快手/老B站)
+    audio_bitrate: int = 0
+    alt_urls: list[str] = field(default_factory=list)   # backup 地址, 逐个重试
 
     @property
     def area(self) -> int:
@@ -134,6 +138,11 @@ class Candidate:
         再次: 文件体积
         """
         return (self.area, self.bitrate, self.size)
+
+    @property
+    def needs_merge(self) -> bool:
+        """是否需要把独立音频轨合并进来（B 站 DASH）。"""
+        return bool(self.audio_url)
 
 
 @dataclass
@@ -151,6 +160,7 @@ class VideoInfo:
     image_urls: list[str] = field(default_factory=list)
     candidates: list[Candidate] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
+    platform: str = "douyin"   # douyin / kuaishou / bilibili
 
     def best(self) -> Candidate | None:
         if not self.candidates:
@@ -327,6 +337,7 @@ def parse_aweme(aweme: Any) -> VideoInfo:
 
 PLATFORM_DOUYIN = "douyin"
 PLATFORM_KUAISHOU = "kuaishou"
+PLATFORM_BILIBILI = "bilibili"
 
 _KS_ID_RE = re.compile(r"^[0-9A-Za-z_-]+$")
 
@@ -465,10 +476,14 @@ def parse_kuaishou(photo: Any, client: dict | None = None) -> VideoInfo:
 
 
 def parse_any(obj: Any) -> VideoInfo:
-    """按平台自动选择解析器。快手对象带 `_platform`/`_ks` 标记。"""
+    """按平台自动选择解析器。快手带 `_platform`/`_ks`, B站带 `_platform`/`_view`。"""
     obj = _as_dict(obj)
     if obj.get("_platform") == PLATFORM_KUAISHOU or obj.get("_ks"):
         return parse_kuaishou(obj)
+    if obj.get("_platform") == PLATFORM_BILIBILI or obj.get("_view"):
+        # 延迟导入: bili 依赖 core, 顶层导入会成环
+        from . import bili
+        return bili.parse_bili_wrapped(obj)
     return parse_aweme(obj)
 
 

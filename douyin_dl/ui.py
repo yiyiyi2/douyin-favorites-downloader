@@ -1265,9 +1265,74 @@ class _Handler(BaseHTTPRequestHandler):
             if what == "log":
                 os.startfile(str(self.bus.log_file))          # noqa: S606
                 return True
+            if what == "site":
+                return self._open_site(body)
         except Exception:
             return False
         return False
+
+    # v2.1: 面板上的「平台选择」—— 点一下就打开对应站点。
+    # 走 CDP 在**用户正在用的那个 Chrome**里新开标签页, 不另起浏览器进程,
+    # 所以登录态、已装的钩子、正在刷的页面全都连续。
+    _SITES = {
+        "douyin": "https://www.douyin.com/",
+        "kuaishou": "https://www.kuaishou.com/new-reco",
+        "bilibili": "https://www.bilibili.com/",
+    }
+
+    def _open_site(self, body: dict) -> bool:
+        which = str(body.get("site") or "").strip().lower()
+        url = self._SITES.get(which)
+        if not url:
+            return False
+        port = int(body.get("port") or 9222)
+        cb = getattr(self.bus, "on_open_site", None)
+        if callable(cb):
+            try:
+                if cb(which, url):
+                    return True
+            except Exception as e:      # noqa: BLE001
+                # 别静默吞: 回调出错时记一笔, 否则面板只看到 "操作失败"
+                try:
+                    with open(self.bus.log_file, "a", encoding="utf-8") as _f:
+                        _f.write(f"  ! 打开 {which} 回调异常: {str(e)[:80]}\n")
+                except Exception:
+                    pass
+        # 兜底: 自己连 CDP 开标签页。
+        # 注意**不能**在这里用 sync_playwright —— 主进程已经在主 greenlet 里
+        # 跑了一个 Playwright, 面板请求在 dy-ui 线程里再起一个会互相干扰、
+        # 而且会把这个 HTTP 请求一直挂住(实测卡死 120 秒以上)。
+        # 这里走纯 CDP websocket: 一条 Target.createTarget 就够, 线程安全。
+        return self._open_site_raw(port, url)
+
+    def _open_site_raw(self, port: int, url: str) -> bool:
+        try:
+            import json as _json
+            import urllib.request as _ur
+            import websocket
+            with _ur.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=3) as r:
+                ws_url = _json.loads(r.read()).get("webSocketDebuggerUrl")
+            if not ws_url:
+                return False
+            conn = websocket.create_connection(ws_url, timeout=8,
+                                               enable_multithread=False)
+            try:
+                conn.send(_json.dumps({
+                    "id": 1, "method": "Target.createTarget",
+                    "params": {"url": url, "background": False},
+                }))
+                while True:
+                    msg = _json.loads(conn.recv())
+                    if msg.get("id") == 1:
+                        return bool((msg.get("result") or {}).get("targetId"))
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            return False
 
 
 def start_ui(bus: EventBus, web_file: Path, port: int = 8899,

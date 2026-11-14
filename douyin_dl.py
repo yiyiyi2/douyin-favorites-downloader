@@ -105,6 +105,7 @@ try:
         verify_video,
         VideoInfo,
     )
+    from douyin_dl import bili
 except Exception as _e:      # noqa: BLE001
     _dep_error(_e)
     raise
@@ -456,6 +457,60 @@ class Downloader(threading.Thread):
         self.submit(aw, "重试")
         return True, ""
 
+    def _fill_bili(self, info: VideoInfo) -> VideoInfo:
+        """
+        给 B 站视频补齐画质信息: view(拿 cid + 标题/作者) → playurl(DASH 轨)。
+
+        收藏列表/推荐流给的信息很浅(可能只有 bvid), 而 DASH 码率表必须
+        另外请求 playurl 才有, 且需要 cid。这两步都是普通 REST, 不需要
+        浏览器签名, 所以直接 requests 拿。失败就把原 info 还回去,
+        让上层按"没有可用地址"处理并给出明确原因。
+        """
+        bvid = info.aweme_id
+        try:
+            view = bili.fetch_view(self.session, bvid, log=self.log)
+            if not view:
+                self.log("  ! B站 view 拿不到(可能已删除/私密/需要登录)")
+                return info
+            # view 里有完整标题/作者/封面, 比列表接口的准
+            fresh = bili.parse_bili_view(view, bvid)
+            if fresh.desc:
+                info.desc = fresh.desc
+            if fresh.author:
+                info.author = fresh.author
+            if fresh.author_id:
+                info.author_id = fresh.author_id
+            if fresh.cover_urls:
+                info.cover_urls = fresh.cover_urls
+            if fresh.duration:
+                info.duration = fresh.duration
+            if fresh.create_time:
+                info.create_time = fresh.create_time
+            info.raw = fresh.raw
+            cid = int((fresh.raw or {}).get("cid") or 0)
+            if not cid:
+                self.log("  ! B站 view 里没有 cid, 跳过")
+                return info
+            dash = bili.fetch_dash(self.session, bvid, cid, log=self.log)
+            if not dash:
+                self.log("  ! B站 playurl 拿不到播放地址")
+                return info
+            # 老视频只有 durl(音视频合一的 mp4 分段), 不需要合并
+            durl_cands = bili.dash_to_durl_candidates(dash)
+            if durl_cands:
+                info.candidates = durl_cands
+                self.log(f"  · B站老格式(durl): {len(durl_cands)} 段, 无需合并")
+                return info
+            bili.attach_dash(info, dash)
+            if info.candidates:
+                qs = sorted({c.gear_name for c in info.candidates}, key=len)
+                self.log(f"  · B站画质档: {'/'.join(qs)} "
+                         f"(共 {len(info.candidates)} 条轨, 音视频分离需合并)")
+            return info
+        except Exception as e:  # noqa: BLE001
+            self.log(f"  ! B站补全信息异常: {str(e)[:100]}")
+            return info
+
     def process(self, aweme: dict, source: str):
         # 推荐页(feed/related)列表里的候选 URL 带 ply_type=4&tk=webid,
         # 是页面播放器的内部令牌流, requests 直接下会 403。
@@ -497,6 +552,11 @@ class Downloader(threading.Thread):
         info = parse_any(aweme)
         if not info.aweme_id:
             return
+
+        # v2.1 B站: 列表接口里没有画质数据, 必须补 view(拿 cid) + playurl(拿 DASH)。
+        # 这两个接口直连即可, 不需要无头浏览器, 所以不用像抖音那样排队等详情。
+        if info.platform == "bilibili" and not info.candidates:
+            info = self._fill_bili(info)
 
         if self.state.has(info.aweme_id):
             self.count_skip += 1
@@ -589,8 +649,16 @@ class Downloader(threading.Thread):
             if i:
                 self.log(f"  换候选 {i + 1}/{min(len(order), 5)}: "
                          f"{cand.width}x{cand.height} 码率={cand.bitrate or '?'}")
-            if download(self.session, cand.url, dest, log=self.log,
-                        on_progress=lambda d, t: self._ev("progress", aid, d, t)):
+            # v2.1 B站: DASH 音视频分离, 要走「下两路 + ffmpeg 合并」;
+            # 抖音/快手是音视频合一的 mp4, 走原来的单流下载。
+            if getattr(cand, "needs_merge", False):
+                got = bili.download_dash(
+                    self.session, cand, dest, log=self.log,
+                    on_progress=lambda d, t: self._ev("progress", aid, d, t))
+            else:
+                got = download(self.session, cand.url, dest, log=self.log,
+                               on_progress=lambda d, t: self._ev("progress", aid, d, t))
+            if got:
                 ok = True
                 best = cand
                 # v1.6: 退到备用候选后, res 还停在 order[0] 的画质, 结果
@@ -1028,6 +1096,21 @@ def main():
         except Exception:
             pass
     bus.on_out_dir = _on_out_dir
+
+    # v2.1: 面板「打开某个平台」—— 在用户正在用的那个浏览器里新开标签页。
+    # 交给 watcher 做(它持有 Playwright 的 greenlet), 比面板自己连 CDP 稳;
+    # 面板那边的 _open_site 只在 watcher 还没就绪时兜底。
+    def _on_open_site(which: str, url: str) -> bool:
+        fn = getattr(watcher, "open_site_tab", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn(which, url))
+        except Exception as e:      # noqa: BLE001
+            log(f"  ! 打开 {which} 失败: {str(e)[:80]}")
+            return False
+
+    bus.on_open_site = _on_open_site
 
     rc = 0
     try:

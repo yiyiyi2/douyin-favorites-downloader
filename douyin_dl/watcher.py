@@ -31,11 +31,52 @@ from typing import Any, Callable
 
 from playwright.sync_api import sync_playwright
 
-from douyin_dl.core import UA, PLATFORM_KUAISHOU, parse_kuaishou
+from douyin_dl.core import (
+    UA,
+    PLATFORM_KUAISHOU,
+    PLATFORM_BILIBILI,
+    parse_kuaishou,
+)
+
+# B站解析要用的小工具(core 里的同名函数是给抖音结构化数据用的,
+# 这里数据更脏, 用这几个宽容版本)。
+def _bili_str(v: Any) -> str:
+    if v is None or isinstance(v, bool):
+        return ""
+    if isinstance(v, (dict, list, tuple, set)):
+        return ""
+    return str(v).strip()
+
+
+def _bili_int(v: Any, default: int = 0) -> int:
+    if v is None or isinstance(v, bool):
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
 
 # v1.7: 两个站点一视同仁。判「浏览器里还有没有页面」「要不要自动开页」
 # 都得同时认这两个域名, 否则用户只刷快手时会被强开抖音页 / 被判关站。
-_SITE_DOMAINS = ("douyin.com", "kuaishou.com")
+_SITE_DOMAINS = ("douyin.com", "kuaishou.com", "bilibili.com")
+
+# v2.1: 面板「打开某个平台」用。把 URL 映射回平台名, 用于
+# 「已经有了就不叠新标签, 直接切到前台」。
+_SITE_KEYS = (
+    ("douyin", ("douyin.com",)),
+    ("kuaishou", ("kuaishou.com",)),
+    ("bilibili", ("bilibili.com", "b23.tv")),
+)
+
+
+def _site_of(url: str) -> str:
+    """URL 属于哪个平台, 认不出来返回空串。"""
+    u = (url or "").lower()
+    for key, hosts in _SITE_KEYS:
+        if any(h in u for h in hosts):
+            return key
+    return ""
 
 # 主循环退出码。daemon.py 只把 EXIT_INTENTIONAL(7) 当"用户主动关, 别再拉起",
 # 其他码一律按"崩了"处理并重启。裸 return 会返回 None -> sys.exit(None)=0,
@@ -70,12 +111,12 @@ def _cap_set(s: set, limit: int) -> int:
 # writable —— 否则抛 "Invalid property descriptor", 钩子会静默失效。
 # 这个坑踩过一次, 这里保持正确写法。
 # ---------------------------------------------------------------------------
-HOOK_VER = 11   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
+HOOK_VER = 12   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
 
 HOOK_JS = r"""
 (() => {
   // 版本号: 改动钩子逻辑就 +1, 否则页面里的旧版本会靠守卫把新版本挡掉(踩过坑)
-  const HOOK_VER = 11;
+  const HOOK_VER = 12;
   if (window.__DY_HOOK_VER__ === HOOK_VER) return;
   // 需要搭便车的接口
   const DATA_EP = [
@@ -91,6 +132,13 @@ HOOK_JS = r"""
     "/rest/v/collect/list",               // 我的收藏列表
     "/rest/v/feed/liked",                 // 我赞过的
     "/rest/v/search/feed",                // 搜索结果
+    // ---- v2.1 B站: /x/... 风格, DASH 音视频分离 ----
+    "/x/web-interface/view",              // 视频基本信息(含 cid, 必须配 playurl)
+    "/x/player/playurl",                  // DASH 码率表(画质来源)
+    "/x/web-interface/archive/related",   // 相关推荐
+    "/x/web-interface/wbi/index/top/feed/rcmd",  // 首页推荐
+    "/x/v3/fav/resource/list",            // 我的收藏列表
+    "/x/web-interface/newlist",           // 分区最新
   ];
   // 收藏动作
   const ACT_EP = [
@@ -100,9 +148,16 @@ HOOK_JS = r"""
     // ---- v1.7 快手: 请求体 JSON {"photoId":..,"userId":..,"collect":1|2} ----
     // collect=1 收藏 / collect=2 取消收藏。和抖音的 1/0 不一样, 别照抄。
     "/rest/v/photo/collect",
+    // ---- v2.1 B站: form 体 rid=<aid>&type=2&add_media_ids=X&del_media_ids=
+    // add_media_ids 非空 = 收藏; del_media_ids 非空 = 取消收藏。
+    "/x/v3/fav/resource/deal",
   ];
 
   const hit = (u, arr) => !!u && arr.some((k) => u.includes(k));
+
+  // v2.1: 当前页是不是 B 站。有些识别规则(收藏按钮 class 带 fav)只在 B 站放宽,
+  // 免得在抖音/快手页上误判成收藏点击。
+  const IS_BILI = /(^|\.)bilibili\.com$|(^|\.)b23\.tv$/.test(location.hostname || "");
 
   // 记录「用户真的点了收藏按钮」的时刻。
   // 页面加载时的同步请求和用户点击区分不开, 靠这个时间戳来判真。
@@ -119,6 +174,13 @@ HOOK_JS = r"""
   // 正则完全对不上, 单独来一条。路径里一般就长这样: /short-video/<id>
   const KS_RE = new RegExp("/(?:short-video|photo|fw/photo)/([0-9A-Za-z_-]{8,32})");
   const pickKs = (s) => { const m = s && s.match(KS_RE); return m ? m[1] : ""; };
+  // v2.1 B站: BV 号(BV + 10 位) 或 av 号。URL 形如 /video/BV1xx411c7mD
+  const BILI_RE = new RegExp("(/video/(BV[0-9A-Za-z]{10}))|(/video/av(\\d+))", "i");
+  const pickBili = (s) => {
+    const m = s && s.match(BILI_RE);
+    if (!m) return "";
+    return m[2] ? m[2] : ("av" + m[4]);
+  };
 
   const idFromNode = (el) => {
     // v1.7: 下面的循环都会改 el(往上爬), 必须先把「原始点击元素」存一份。
@@ -132,6 +194,7 @@ HOOK_JS = r"""
       if (v) return v;
     }
     // 2) v1.7 快手: 卡片上常挂 data-photo-id / data-video-id, 第 1 步认不到时试这里
+    //    v2.1 B站: 链接里是 /video/BVxxxx, 也在这里认
     let k = start;
     for (let i = 0; i < 12 && k; i++, k = k.parentElement) {
       if (!k.getAttribute) continue;
@@ -140,6 +203,8 @@ HOOK_JS = r"""
       const href = k.href || k.getAttribute("href") || "";
       const kh = pickKs(href);
       if (kh) return kh;
+      const bh = pickBili(href);
+      if (bh) return bh;
     }
     // 3) 退而求其次: 往上找带 id 的属性 / 链接 / data-e2e(同样从原始元素开始)
     let n = start;
@@ -151,6 +216,9 @@ HOOK_JS = r"""
       if (href) {
         const m = href.match(new RegExp("/(?:video|note)/([0-9]{15,})"));
         if (m) return m[1];
+        // v2.1 B站: 收藏按钮附近常包着指向视频的 <a href="/video/BVxxxx">
+        const b = pickBili(href);
+        if (b) return b;
       }
       const got = pickId(a);
       if (got) return got;
@@ -158,7 +226,7 @@ HOOK_JS = r"""
     // 4) 最后从页面地址里取, 但必须保证是当前播放的那个
     const cur = location.href.match(new RegExp("/(?:video|note)/([0-9]{15,})"));
     if (cur) return cur[1];
-    return pickKs(location.href) || "";
+    return pickKs(location.href) || pickBili(location.href) || "";
   };
 
   document.addEventListener("click", (ev) => {
@@ -176,6 +244,11 @@ HOOK_JS = r"""
         const cls = (el.className || "").toString();
         const lbl = (el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "");
         if (/collect/i.test(cls) && cls.length < 200) { hit = true; mark = "cls:" + cls.slice(0, 40); break; }
+        // v2.1 B站: 工具栏收藏按钮的 class 里是 fav 而不是 collect
+        // (形如 video-fav / bili-video-fav), 只在 B 站域名下放宽, 免得误伤
+        if (IS_BILI && /(^|[\s-])fav([\s-]|$)|favorite/i.test(cls) && cls.length < 200) {
+          hit = true; mark = "cls:" + cls.slice(0, 40); break;
+        }
         if (lbl && lbl.length <= 12 && /收藏/.test(lbl)) { hit = true; mark = "lbl:" + lbl; break; }
         const txt = ((el.innerText || "") + " " + lbl).trim();
         if (txt && txt.length <= 12 && /收藏/.test(txt)) { hit = true; mark = "text:" + txt; break; }
@@ -700,6 +773,249 @@ def ks_action_value(url: str, body: Any = None, req: Any = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# v2.1 B站
+#
+# B站和快手/抖音的本质差别: 画质数据**不在列表接口里**。
+# 列表(/x/v3/fav/resource/list、推荐流)只有标题/封面/bvid,
+# 真正的 DASH 码率表要另外请求 /x/player/playurl?bvid=&cid= 才有,
+# 而且要用 view 接口拿到的 cid。所以 B站走"三步":
+#   1) 收藏动作 → 拿到 bvid（或 aid, 要转）
+#   2) view 接口 → 拿 cid + 标题/作者/封面
+#   3) playurl  → 拿 DASH 轨 → 下载视频轨+音频轨 → ffmpeg 合并
+# 这三步都不需要浏览器签名（实测直连即可），所以完全不用无头浏览器。
+# ---------------------------------------------------------------------------
+
+_BILI_ID_KEYS = ("bvid", "bvid_str", "aid", "avid")
+_BILI_VIDEO_KEYS = ("dash", "dimension", "pages", "cid", "pic", "duration")
+
+# BV 号: BV + 10 位 base58 风格字符; av 号: av + 数字
+_BILI_BV_RE = re.compile(r"^BV[0-9A-Za-z]{10}$")
+_BILI_AV_RE = re.compile(r"^av\d+$", re.IGNORECASE)
+
+
+def _is_bili_id(v: Any) -> bool:
+    """是不是 B 站视频 id（BV 号或 av 号）。"""
+    s = _bili_str(v).strip()
+    if not s:
+        return False
+    return bool(_BILI_BV_RE.match(s) or _BILI_AV_RE.match(s))
+
+
+def _norm_bili_id(v: Any) -> str:
+    """把 bvid / aid / "aid=123" / 纯数字都统一成 BV 号或 av 号。"""
+    if isinstance(v, dict):
+        for k in ("bvid", "bvid_str"):
+            s = _bili_str(v.get(k)).strip()
+            if _BILI_BV_RE.match(s):
+                return s
+        for k in ("aid", "avid", "id"):
+            n = _bili_int(v.get(k), 0)
+            if n:
+                return f"av{n}"
+        return ""
+    s = _bili_str(v).strip()
+    if _BILI_BV_RE.match(s):
+        return s
+    if _BILI_AV_RE.match(s):
+        return "av" + s[2:].lstrip("0") or s
+    # 接口里 aid 常是纯数字
+    if s.isdigit() and len(s) <= 15:
+        return f"av{s}"
+    return ""
+
+
+def looks_like_bili_video(node: Any) -> bool:
+    """这个 dict 像不像 B 站的一条视频记录（列表项 / view 的 data）。"""
+    if not isinstance(node, dict):
+        return False
+    has_id = any(k in node for k in _BILI_ID_KEYS)
+    if not has_id:
+        return False
+    return any(k in node for k in _BILI_VIDEO_KEYS)
+
+
+def extract_bili_videos(obj: Any, depth: int = 0) -> list[dict]:
+    """
+    从 B站列表响应里抽出视频记录。
+    兼容三种形状:
+      · /x/v3/fav/resource/list  → data.medias[] (type=2 才是视频)
+      · 推荐流                    → data.item[] / data.archives[]
+      · view 的 data              → 直接就是一条
+    """
+    out: list[dict] = []
+    if depth > 14:
+        return out
+    if isinstance(obj, str):
+        t = obj.strip()
+        if t[:1] in "{[" and len(t) < 8 * 1024 * 1024:
+            try:
+                return extract_bili_videos(json.loads(t), depth + 1)
+            except Exception:
+                return out
+        return out
+    if isinstance(obj, dict):
+        # 收藏列表: {data: {medias: [{type:2, bvid, title, cover, ...}]}}
+        if looks_like_bili_video(obj):
+            # 收藏列表项可能有 type=2(视频)/12(音频)/21(专栏), 只收视频
+            t = obj.get("type")
+            if t is None or _bili_int(t, 0) in (0, 2):
+                out.append(obj)
+                return out
+        for v in obj.values():
+            out.extend(extract_bili_videos(v, depth + 1))
+        return out
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            out.extend(extract_bili_videos(v, depth + 1))
+    return out
+
+
+def collect_bili_ids(obj: Any, depth: int = 0) -> list[str]:
+    """从 B站请求/响应体里挖出 bvid / aid。"""
+    ids: list[str] = []
+
+    def add(v: Any) -> None:
+        got = _norm_bili_id(v)
+        if got and got not in ids:
+            ids.append(got)
+
+    if depth > 10:
+        return ids
+    if isinstance(obj, str):
+        t = obj.strip()
+        if t[:1] in "{[" and len(t) < 4 * 1024 * 1024:
+            try:
+                return collect_bili_ids(json.loads(t), depth + 1)
+            except Exception:
+                return ids
+        return ids
+    if isinstance(obj, dict):
+        for k in _BILI_ID_KEYS:
+            if k in obj:
+                add(obj.get(k))
+        for v in obj.values():
+            if isinstance(v, (dict, list, tuple)):
+                for x in collect_bili_ids(v, depth + 1):
+                    if x not in ids:
+                        ids.append(x)
+        return ids
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            for x in collect_bili_ids(v, depth + 1):
+                if x not in ids:
+                    ids.append(x)
+    return ids
+
+
+def bili_ids_from_url(url: str) -> list[str]:
+    """从 B站 URL 里抠 BV/av 号: /video/BVxxxx 、 ?bvid=BVxxxx 、 ?aid=123。"""
+    ids: list[str] = []
+    u = url or ""
+    try:
+        m = re.search(r"/video/(BV[0-9A-Za-z]{10})", u)
+        if m:
+            ids.append(m.group(1))
+        m2 = re.search(r"/video/av(\d+)", u, re.IGNORECASE)
+        if m2:
+            ids.append("av" + m2.group(1))
+        qs = u.split("?", 1)[1] if "?" in u else ""
+        for k, v in parse_qsl(qs, keep_blank_values=False):
+            kl = k.lower()
+            if kl == "bvid" and _BILI_BV_RE.match(v) and v not in ids:
+                ids.append(v)
+            elif kl in ("aid", "avid") and v.isdigit() and f"av{v}" not in ids:
+                ids.append(f"av{v}")
+    except Exception:
+        pass
+    return ids
+
+
+def bili_action_value(url: str, body: Any = None, req: Any = None) -> str:
+    """B站这次 /x/v3/fav/resource/deal 在干嘛, 返回 "1"(收藏)/"0"(取消)/""
+
+    实测(2026-11-14), 请求体是 form:
+      rid=<aid>&type=2&add_media_ids=<收藏夹id>&del_media_ids=&csrf=<bili_jct>
+    收藏 = add_media_ids 非空; 取消收藏 = del_media_ids 非空。
+    注意 rid 是 **aid(纯数字)**, 不是 BV 号 —— 调用方要用 av 形式。
+    """
+    def pick(src) -> str:
+        if isinstance(src, str):
+            t = src.strip()
+            if not t:
+                return ""
+            if t.startswith("{"):
+                try:
+                    src = json.loads(t)
+                except Exception:
+                    return ""
+            elif "=" in t:
+                try:
+                    src = dict(parse_qsl(t, keep_blank_values=True))
+                except Exception:
+                    return ""
+            else:
+                return ""
+        if not isinstance(src, dict):
+            return ""
+        adds = _bili_str(src.get("add_media_ids") or src.get("addMediaIds")).strip()
+        dels = _bili_str(src.get("del_media_ids") or src.get("delMediaIds")).strip()
+        if adds:
+            return "1"
+        if dels:
+            return "0"
+        # 有些版本用 action/fav 标记
+        for k in ("action", "fav", "collect"):
+            if k in src:
+                n = _bili_str(src.get(k)).strip().lower()
+                if n in ("1", "true", "add", "fav", "collect"):
+                    return "1"
+                if n in ("2", "0", "false", "del", "unfav", "cancel"):
+                    return "0"
+        return ""
+
+    for src in (req, body):
+        a = pick(src)
+        if a:
+            return a
+    return ""
+
+
+def bili_action_rid(url: str, body: Any = None, req: Any = None) -> str:
+    """取 B站收藏动作里的 rid（= aid），转成 av 号。"""
+    def pick(src) -> str:
+        if isinstance(src, str):
+            t = src.strip()
+            if not t:
+                return ""
+            if t.startswith("{"):
+                try:
+                    src = json.loads(t)
+                except Exception:
+                    return ""
+            elif "=" in t:
+                try:
+                    src = dict(parse_qsl(t, keep_blank_values=True))
+                except Exception:
+                    return ""
+            else:
+                return ""
+        if not isinstance(src, dict):
+            return ""
+        rid = _bili_str(src.get("rid") or src.get("aid") or src.get("avid")).strip()
+        if rid.isdigit():
+            return f"av{rid}"
+        if _BILI_BV_RE.match(rid):
+            return rid
+        return ""
+
+    for src in (req, body):
+        got = pick(src)
+        if got:
+            return got
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Chrome 管理
 # ---------------------------------------------------------------------------
 
@@ -828,6 +1144,9 @@ class BrowserWatcher:
         self._pause_noted = False
         self._lock = threading.Lock()
         self._pending_actions: list[str] = []
+        # v2.1: 面板点「打开平台」的请求队列。Playwright sync API 不能跨线程,
+        # 所以面板线程只入队, 由主循环 tick 时执行。
+        self._open_site_q: list[tuple[str, str]] = []
         # v1.7.1: 坏页面拉黑表 {url: 解禁时间戳} + 它的锁
         self._bad_pages: dict[str, float] = {}
         self._hook_lock = threading.Lock()
@@ -948,6 +1267,146 @@ class BrowserWatcher:
         """
         u = (url or "").lower()
         return "kuaishou.com" in u or "gifshow.com" in u or "/rest/v/" in u
+
+    # ------------------------------------------------------------------
+    # v2.1 B站事件分支
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_bili_url(url: str) -> bool:
+        u = (url or "").lower()
+        return ("bilibili.com" in u or "b23.tv" in u
+                or "/x/web-interface/" in u or "/x/player/playurl" in u
+                or "/x/v3/fav/" in u)
+
+    def _on_bili_payload(self, kind: str, url: str, body: Any, req: Any,
+                         body_text: str, req_text: str):
+        """
+        B站事件独立分支。
+
+        和抖音/快手最大的不同: **列表接口里没有画质数据**。
+        /x/v3/fav/resource/list 只给 bvid/标题/封面,
+        真正的 DASH 轨必须另外请求 /x/player/playurl?bvid=&cid=。
+        而 cid 要先从 /x/web-interface/view 拿。
+
+        好消息是这三个接口都不需要浏览器签名(实测直连即可),
+        所以这里可以直接提交一个只带 bvid 的包装对象,
+        让 Downloader 去补 view + playurl —— 不需要无头浏览器。
+        """
+        if kind == "click":
+            try:
+                info = json.loads(body_text) if (body_text or "").strip().startswith("{") else {}
+            except Exception:
+                info = {}
+            self.log(f"  · 检测到B站收藏点击 [{info.get('mark') or '?'}] "
+                     f"视频={info.get('id') or '未知'}")
+            return
+
+        if kind == "data":
+            vids = extract_bili_videos(body)
+            if not vids:
+                return
+            wrapped: list[dict] = []
+            for v in vids:
+                bid = _norm_bili_id(v)
+                if not bid:
+                    continue
+                wrapped.append({
+                    "aweme_id": bid,
+                    "_platform": PLATFORM_BILIBILI,
+                    "_view": v,
+                })
+            if not wrapped:
+                return
+            self._remember(wrapped)
+
+            if "/x/v3/fav/resource/list" in url:
+                # 收藏列表只建基线, 不触发下载(第一页会自己轮换, 靠比对
+                # 会把旧收藏当新的重下 —— 和抖音/快手同一套规矩)。
+                with self._lock:
+                    fresh_baseline = not self.baseline_done
+                    self.baseline_done = True
+                    self.known_favs.update(w["aweme_id"] for w in wrapped)
+                    if len(self.known_favs) > _SET_CAP_FAVS:
+                        _cap_set(self.known_favs, _SET_CAP_FAVS)
+                if fresh_baseline and self.download_all_on_start:
+                    self.log(f"  B站收藏基线: {len(wrapped)} 个, 开始回补下载")
+                    for w in wrapped:
+                        self.on_aweme(w, "B站收藏列表")
+                elif fresh_baseline:
+                    self.log(f"  B站收藏基线: 已记录 {len(wrapped)} 个已有收藏(只下新的)")
+                return
+
+            # 自动下推荐页: 和抖音/快手同一开关
+            if self.auto_recommend and any(
+                k in url for k in ("/x/web-interface/wbi/index/top/feed/rcmd",
+                                   "/x/web-interface/archive/related",
+                                   "/x/web-interface/newlist")
+            ):
+                todo: list[dict] = []
+                with self._lock:
+                    for w in wrapped:
+                        aid = w["aweme_id"]
+                        if aid in self._auto_submitted or aid in self.known_favs:
+                            continue
+                        self._auto_submitted.add(aid)
+                        todo.append(w)
+                    if len(self._auto_submitted) > _SET_CAP_AUTO:
+                        _cap_set(self._auto_submitted, _SET_CAP_AUTO)
+                if todo:
+                    self.log(f"  B站推荐页: 新增 {len(todo)} 个视频进队列 "
+                             f"(累计提交 {len(self._auto_submitted)})")
+                    for w in todo:
+                        try:
+                            # 「B站推荐」不是「推荐页」: 不需要详情页重抓,
+                            # 直连 API 就能补全, 交给 Downloader。
+                            self.on_aweme(w, "B站推荐")
+                        except Exception as e:
+                            self.log(f"  ! B站推荐提交失败 {w['aweme_id']}: {e}")
+                            with self._lock:
+                                self._auto_submitted.discard(w["aweme_id"])
+            return
+
+        if kind == "action":
+            act = bili_action_value(url, body, req)
+            # 收藏动作的 rid 是 aid(纯数字), 要转成 av 号;
+            # 万一拿不到就退而用响应体/URL 里的 bvid。
+            rid = bili_action_rid(url, body, req)
+            ids = ([rid] if rid else []) or collect_bili_ids(req) \
+                or bili_ids_from_url(url) or collect_bili_ids(body)[:1]
+            self.log(f"  · B站收藏接口 action={act or '?'} "
+                     f"req={req_text[:120] if req_text else '(空)'}")
+            if not ids:
+                return
+            if act == "0":
+                self.log(f"  · 取消收藏 {ids[0]} (不下载)")
+                with self._lock:
+                    self._pending_actions = [a for a in self._pending_actions
+                                             if a not in ids]
+                return
+            if act != "1":
+                self.log(f"  · 忽略B站状态同步请求 {ids[0]} (没有 add/del_media_ids)")
+                return
+            for aid in ids[:8]:
+                cached = self._get_cached(aid)
+                if cached:
+                    # 缓存里通常只有列表接口给的那点信息(没 DASH),
+                    # 但 Downloader 会自己补 view+playurl, 所以能直接提交。
+                    self.log(f"  · 新收藏 {aid} (B站), 直接下载")
+                    try:
+                        self.on_aweme(cached, "B站收藏")
+                    except Exception as e:
+                        self.log(f"  ! B站收藏提交失败 {aid}: {e}")
+                    continue
+                with self._lock:
+                    if aid in self._pending_actions:
+                        continue
+                    self._pending_actions.append(aid)
+                try:
+                    self.on_pending(aid)
+                except Exception:
+                    pass
+                self.log(f"  · 新收藏 {aid} (B站), 正在抓取视频信息…")
+            return
 
     def _on_ks_payload(self, kind: str, url: str, body: Any, req: Any,
                        body_text: str, req_text: str):
@@ -1083,6 +1542,16 @@ class BrowserWatcher:
         # (快手 /rest/v/..., 抖音 /aweme/v1/...), 硬塞进同一个分支只会互相干扰。
         if self._is_ks_url(url):
             self._on_ks_payload(kind, url, body, req, body_text, req_text)
+            return
+
+        # v2.1: B站也是独立一套(/x/... 风格, 且画质要另外请求 playurl)
+        if self._is_bili_url(url):
+            self._on_bili_payload(kind, url, body, req, body_text, req_text)
+            return
+
+        # v2.1: B站也是独立一套(/x/... 风格, 且画质要另外请求 playurl)
+        if self._is_bili_url(url):
+            self._on_bili_payload(kind, url, body, req, body_text, req_text)
             return
 
         if kind == "click":
@@ -1585,6 +2054,71 @@ class BrowserWatcher:
         self._install_hook(page)
         return page
 
+    def open_site_tab(self, which: str, url: str) -> bool:
+        """
+        v2.1: 面板上点「抖音 / 快手 / B站」时, 在用户正在用的浏览器里开一个标签页。
+
+        Playwright 的 sync API 只能在主循环那个 greenlet 里调用(跨线程会报
+        "Cannot switch to a different thread"), 而面板的 HTTP 请求跑在 dy-ui
+        线程里 —— 所以这里不能直接操作 page, 只能把请求登记到队列,
+        由主循环下次 tick 时执行。返回 True 表示"已受理", 不代表已经开完。
+        """
+        which = str(which or "").strip().lower()
+        if not which or not url:
+            return False
+        with self._lock:
+            self._open_site_q.append((which, url))
+        self.log(f"  · 面板请求打开 {which}")
+        return True
+
+    def _drain_open_site(self, ctx):
+        """主循环里执行面板排队的「打开平台」请求。"""
+        while True:
+            try:
+                with self._lock:
+                    if not self._open_site_q:
+                        return
+                    which, url = self._open_site_q.pop(0)
+            except Exception:
+                return
+            try:
+                # 已经开着同站页面就直接把它切到前台, 不再叠新标签
+                existing = None
+                for pg in list(ctx.pages):
+                    try:
+                        if _site_of(pg.url or "") == which:
+                            existing = pg
+                            break
+                    except Exception:
+                        continue
+                if existing is not None:
+                    try:
+                        existing.bring_to_front()
+                    except Exception:
+                        pass
+                    self.log(f"  · 已有 {which} 标签页, 已切到前台")
+                    continue
+                page = None
+                for pg in list(ctx.pages):
+                    try:
+                        if (pg.url or "").startswith("about:"):
+                            page = pg
+                            break
+                    except Exception:
+                        continue
+                if page is None:
+                    page = ctx.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(1.5)
+                self._install_hook(page)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+                self.log(f"  ✔ 已打开 {which}")
+            except Exception as e:      # noqa: BLE001
+                self.log(f"  ! 打开 {which} 失败: {str(e)[:80]}")
+
     def _close_bg(self):
         """停掉无头解析线程(退出时调用)。"""
         try:
@@ -1925,6 +2459,9 @@ class BrowserWatcher:
                     self.drain()
                     if self._pending_actions:
                         self._resolve_pending()
+                    # v2.1: 面板点「打开平台」的请求(只能在主 greenlet 里执行)
+                    if self._open_site_q:
+                        self._drain_open_site(ctx)
                     tick += 1
                     # v1.5: auto_recommend 开着时自动翻推荐页。
                     # 抖音 web 在"停留看当前视频"时不发新 feed 请求, 只有滑到

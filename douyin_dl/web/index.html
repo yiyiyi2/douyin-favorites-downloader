@@ -55,6 +55,24 @@
   .dot.on{background:var(--ok);box-shadow:0 0 7px rgba(62,207,142,.75)}
   .dot.off{background:var(--err);box-shadow:0 0 7px rgba(239,91,107,.6)}
   .grow{flex:1}
+  /* v2.1 平台选择: 点一下就打开对应站点, 复用同一个已登录的浏览器 */
+  .sites{display:flex;align-items:center;gap:6px;padding:3px;border-radius:12px;
+         background:rgba(18,23,32,.9);border:1px solid var(--line)}
+  .sites-lbl{font-size:11.5px;color:var(--muted-2);padding:0 5px 0 7px;white-space:nowrap}
+  .site{
+    display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:9px;
+    background:transparent;border:1px solid transparent;color:var(--muted);
+    font-size:12.5px;cursor:pointer;transition:.15s;white-space:nowrap
+  }
+  .site:hover{background:var(--panel-2);color:var(--txt);border-color:var(--line)}
+  .site:active{transform:translateY(1px)}
+  .site .si{width:8px;height:8px;border-radius:50%;background:var(--muted-2);flex:none}
+  .site[data-s="douyin"] .si{background:#25f4ee}
+  .site[data-s="kuaishou"] .si{background:#ff8a3d}
+  .site[data-s="bilibili"] .si{background:#fb7299}
+  .site.on{background:var(--panel-2);color:var(--txt);border-color:var(--line-2)}
+  .site.on .si{box-shadow:0 0 8px currentColor}
+  .site.busy{opacity:.55;pointer-events:none}
   button{
     font:inherit;color:var(--txt);background:var(--panel);border:1px solid var(--line);
     padding:7px 13px;border-radius:10px;cursor:pointer;transition:.15s;white-space:nowrap
@@ -279,6 +297,15 @@
       <span class="chip" id="t-q">画质: 最高</span>
     </div>
     <div class="grow"></div>
+    <div class="sites" id="sites">
+      <span class="sites-lbl">打开</span>
+      <button class="site" data-s="douyin"   onclick="openSite(this)" title="在已登录的浏览器里打开抖音">
+        <i class="si"></i>抖音</button>
+      <button class="site" data-s="kuaishou" onclick="openSite(this)" title="在已登录的浏览器里打开快手">
+        <i class="si"></i>快手</button>
+      <button class="site" data-s="bilibili" onclick="openSite(this)" title="在已登录的浏览器里打开 B站">
+        <i class="si"></i>B站</button>
+    </div>
     <button class="ghost" onclick="toggleLog(true)">设置 / 日志</button>
     <button class="primary" onclick="openWhat('folder')">下载文件夹</button>
     <button onclick="toggleDrawer(true)">设置</button>
@@ -883,6 +910,31 @@ function toggleLog(on){
 async function openWhat(what, id){
   const j = await api("/api/open", {what, id});
   if(!j.ok) toast(j.error || "操作失败");
+}
+// v2.1 平台选择: 在**用户正在用的那个浏览器**里打开对应站点。
+// 不另起浏览器, 所以登录态和已注入的钩子都还在, 打开就能收藏/自动下载。
+async function openSite(btn){
+  const site = btn && btn.dataset ? btn.dataset.s : "";
+  if(!site) return;
+  const label = {douyin:"抖音", kuaishou:"快手", bilibili:"B站"}[site] || site;
+  document.querySelectorAll(".site.on").forEach(b=>b.classList.remove("on"));
+  btn.classList.add("on","busy");
+  try{
+    const j = await api("/api/open", {what:"site", site});
+    if(j && j.ok){
+      toast("已打开 " + label, "在正在用的浏览器里新开了一个标签页");
+      // 站点标签高亮 4 秒后淡出, 表示"这个已经帮你开好了"
+      setTimeout(()=>btn.classList.remove("on"), 4000);
+    } else {
+      toast("打开 " + label + " 失败", (j && j.error) || "浏览器可能没在运行");
+      btn.classList.remove("on");
+    }
+  }catch(e){
+    toast("打开 " + label + " 失败", String(e).slice(0,80));
+    btn.classList.remove("on");
+  }finally{
+    btn.classList.remove("busy");
+  }
 }
 function copyLink(id){
   const u = "https://www.douyin.com/video/" + id;
