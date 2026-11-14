@@ -626,3 +626,100 @@ def test_downloader_process_uses_bili_branch(tmp_path, monkeypatch):
     assert dl.count_ok == 1
     assert dl.state.marked and dl.state.marked[0][0] == BV
     assert (tmp_path / "_meta" / f"{BV}.json").exists()
+
+
+# --------------------------------------------------------------------------
+# v2.1.1 回归: B站 av 号被当成快手 id 送去快手详情页
+# --------------------------------------------------------------------------
+
+def test_is_bili_pending_id_recognizes_bv_and_av():
+    """av 号("av" + 15 位数字)形状恰好满足 _is_ks_id(字母+数字混排 8~32 位),
+    必须在投无头队列前用这个函数先认出来, 否则会被送去打开快手详情页。"""
+    from douyin_dl.watcher import _is_bili_pending_id
+
+    # 真实踩到的那条
+    assert _is_bili_pending_id("av114962919855294") is True
+    assert _is_bili_pending_id("BV1V8huzkE5V") is True
+    assert _is_bili_pending_id("av123") is True
+    # 快手 photoId / 抖音 aweme_id / 垃圾统统不认
+    assert _is_bili_pending_id("3xun955567ak6qe") is False
+    assert _is_bili_pending_id("7700565139293046690") is False
+    assert _is_bili_pending_id("") is False
+    assert _is_bili_pending_id(None) is False
+    assert _is_bili_pending_id("av") is False
+    assert _is_bili_pending_id("BV") is False
+
+
+def test_resolve_pending_routes_bili_id_to_downloader_not_headless():
+    """待补全队列里的 B站 id 必须交给 on_aweme 直接补全, 绝不进 _hl_in。
+
+    这是「B站收藏了一个正常视频却下不了」的直接根因: av 号被 _is_ks_id
+    认成快手 id -> _hl_fetch 打开 kuaishou.com/short-video/av... -> 风控页
+    -> 拿不到数据 -> 报「抓不到视频详情」。
+    """
+    import json as _json
+    from douyin_dl.watcher import (BrowserWatcher, PLATFORM_BILIBILI,
+                                   _is_bili_pending_id)
+
+    w = BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()), log=lambda m: None)
+    got = []
+
+    # 一个足够真实的半成品 watcher: 不走无头线程, 只验证路由分派
+    class _FakeCtx:
+        def cookies(self):
+            return []
+
+    w._ctx = _FakeCtx()
+    w._pending_actions = ["av114962919855294"]
+    w._resolving = set()
+    w.on_aweme = lambda aw, src: got.append((aw, src))
+    w.on_pending = lambda aid: None
+    # 别真起无头线程(会启动 playwright): 换成假队列, 只要被投递就说明路由错了
+    w._ensure_hl_worker = lambda: None
+    w._hl_thread = type("T", (), {"is_alive": lambda self: True})()
+    puts = []
+    w._hl_in = type("Q", (), {"put": lambda self, item: puts.append(item)})()
+
+    w._resolve_pending()
+
+    assert not puts, f"B站 id 不该进无头队列, 却投了 {puts}"
+    assert len(got) == 1
+    aw, src = got[0]
+    assert aw["aweme_id"] == "av114962919855294"
+    assert aw["_platform"] == PLATFORM_BILIBILI
+    assert _is_bili_pending_id(aw["aweme_id"])
+
+
+def test_resolve_pending_still_routes_kuaishou_to_headless():
+    """快手 photoId 不能因为上一条修复被误判成 B站, 仍要进无头队列。"""
+    from douyin_dl.watcher import BrowserWatcher
+
+    w = BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()), log=lambda m: None)
+
+    class _FakeCtx:
+        def cookies(self):
+            return []
+
+    w._ctx = _FakeCtx()
+    w._pending_actions = ["3xun955567ak6qe"]
+    w._resolving = set()
+    w.on_aweme = lambda aw, src: None
+    w.on_pending = lambda aid: None
+    # 同样别真起无头线程
+    w._ensure_hl_worker = lambda: None
+    w._hl_thread = type("T", (), {"is_alive": lambda self: True})()
+    puts = []
+    w._hl_in = type("Q", (), {"put": lambda self, item: puts.append(item)})()
+    # 让 _resolving 立刻清空, 免得等 45 秒超时
+    orig_put = w._hl_in.put
+
+    def _put_then_finish(item):
+        orig_put(item)
+        w._resolving.discard(item[0])
+
+    w._hl_in.put = _put_then_finish
+
+    w._resolve_pending()
+
+    assert puts, "快手 id 应该进无头队列"
+    assert puts[0][0] == "3xun955567ak6qe"

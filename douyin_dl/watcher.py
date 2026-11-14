@@ -429,6 +429,26 @@ def _is_ks_id(v: Any) -> bool:
     return any(c.isdigit() for c in s) and any(c.isalpha() for c in s)
 
 
+_BILI_BV_RE = re.compile(r"^BV[0-9A-Za-z]{10}$")
+_BILI_AV_RE = re.compile(r"^av\d+$", re.IGNORECASE)
+
+
+def _is_bili_pending_id(v: Any) -> bool:
+    """待补全队列里的 id 是不是 B站的 BV/av 号。
+
+    必须在投无头队列**之前**判一次: B站的 av 号形如 "av114962919855294",
+    正好是"字母+数字混排、8~32 位", 会被 `_is_ks_id` 认成快手 id, 然后
+    `_hl_fetch` 拿它去打开 kuaishou.com/short-video/av114962919855294 ——
+    永远拿不到数据, 用户看到的就是"B站收藏下不了"。
+    B站不需要无头浏览器(view/playurl 都是普通 REST), 所以这里认出来就直接
+    交给 Downloader 去补全。
+    """
+    s = str(v or "").strip()
+    if not s:
+        return False
+    return bool(_BILI_BV_RE.match(s) or _BILI_AV_RE.match(s))
+
+
 def _norm_id(v: Any) -> str:
     """把任意形态的 id 归一化成字符串。抖音 id 现在是 19 位数字, 但将来
     可能带前缀/变短/变字符串 —— 别写死 len>=15, 只要"看着像个 id"就收。"""
@@ -2168,6 +2188,18 @@ class BrowserWatcher:
 
         cookies = self._douyin_cookies() + self._ks_cookies()
         for aid in todo:
+            # v2.1.1: B站根本不需要无头浏览器 —— view/playurl 都是普通 REST,
+            # Downloader._fill_bili 自己会补。而且 av 号("av" + 15 位数字)恰好
+            # 满足 _is_ks_id 的形状(字母+数字混排), 投进无头队列会被 _hl_fetch
+            # 当成快手 id 送去打开 kuaishou.com/short-video/av114962919855294,
+            # 必然拿不到数据 —— 用户看到的就是「B站收藏下不了」。
+            # 直接包成 B站平台对象交给 Downloader, 跳过无头抓取。
+            if _is_bili_pending_id(aid):
+                self.log(f"  · 新收藏 {aid} (B站), 交给接口直接补全")
+                self.on_aweme({"aweme_id": aid, "_platform": PLATFORM_BILIBILI},
+                              "B站收藏")
+                self._resolving.discard(aid)
+                continue
             self._resolving.add(aid)
             self._hl_in.put((aid, cookies))
 
