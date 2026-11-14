@@ -5,14 +5,18 @@ set PYTHONIOENCODING=utf-8
 title Douyin Offline Player
 cd /d "%~dp0"
 
-rem 纯离线模式: 只起本地面板 + 播放器, 完全不联网、不碰浏览器、不下载。
-rem 想刷已经下好的视频时双击这个, 没网也能用。
+rem Pure offline mode: only the local panel + player.
+rem No internet, no Chrome, no downloading.
+rem Keep every rem line ASCII-only: cmd.exe parses a .bat with the
+rem system ANSI codepage (GBK) whatever chcp says, so UTF-8 Chinese
+rem inside a rem line byte-shifts and gets executed as a command.
+rem Chinese is fine inside echo (passed through verbatim).
 
 where pythonw >nul 2>nul
 if errorlevel 1 goto TRYPY
 start "" pythonw douyin_dl.py --offline %*
 echo [OK] 离线播放器启动中, 浏览器马上会打开...
-echo      如果没自动打开, 手动访问: http://127.0.0.1:8899/player
+echo      没自动打开就手动访问: http://127.0.0.1:8899/player
 timeout /t 3 >nul
 start "" http://127.0.0.1:8899/player
 exit /b 0
@@ -25,6 +29,6 @@ pause
 exit /b %errorlevel%
 
 :NOPY
-echo [ERROR] 没找到 Python。请先装 Python 3.10+ 并勾选 Add python.exe to PATH
+echo [ERROR] python not found. Install Python 3.10+ with Add to PATH.
 pause
 exit /b 1

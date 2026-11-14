@@ -476,3 +476,30 @@ def test_escape_handled_before_input_guard():
     i_esc = handler.index("k === 'escape'")
     i_guard = handler.index("e.target.tagName === 'TEXTAREA'")
     assert i_esc < i_guard, "Esc 被输入框判断挡在后面了, 关不掉评论抽屉"
+
+
+def test_offline_bat_is_cmd_safe():
+    """v2.5.1 回归: .bat 必须能被 cmd.exe 正确解析。
+
+    踩过两个坑, 都表现为双击后报一串 "xxx is not recognized as an internal
+    or external command":
+    1. LF 行尾 —— cmd.exe 要 CRLF, 纯 LF 时整份脚本会被当成一行乱解析,
+       连 goto 标签都失效, 表现为直接退回交互式 shell。
+    2. rem/注释行里放中文 —— 不管 chcp 说什么, cmd.exe 都用系统 ANSI 代码页
+       (GBK) 去解析 .bat 的字节, UTF-8 中文在 rem 里会错位成可执行片段。
+       中文只能出现在 echo 后面。
+    """
+    p = _ROOT / "离线刷视频.bat"
+    assert p.exists()
+    raw = p.read_bytes()
+
+    lf = raw.count(b"\n")
+    crlf = raw.count(b"\r\n")
+    assert crlf > 0 and lf == crlf, (
+        f"行尾必须是纯 CRLF: CRLF={crlf} 总LF={lf} (纯 LF 会让 cmd.exe 解析错乱)")
+
+    text = raw.decode("utf-8")
+    for ln in text.split("\r\n"):
+        s = ln.strip()
+        if s.lower().startswith("rem"):
+            assert s.isascii(), f"rem 行里不能有中文(cmd 按 GBK 解析会报错): {s!r}"

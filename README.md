@@ -1,8 +1,8 @@
-# 抖音 / 快手 / B站收藏自动下载 · v2.5
+# 抖音 / 快手 / B站收藏自动下载 · v2.5.1
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-2.5.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.5.1-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -167,6 +167,23 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.5.1
+
+**主题：修 `离线刷视频.bat` 双击报错。**
+
+- **现象**：双击后弹一串 `'这个' is not recognized as an internal or external
+  command` / `'f-8' 不是内部或外部命令`，然后直接退出，播放器起不来。
+- **根因一（主因）**：`.bat` 里 `rem` 注释行写了中文。**不管 `chcp` 说什么，
+  cmd.exe 都用系统 ANSI 代码页（GBK）去解析 `.bat` 的字节**，UTF-8 中文在
+  `rem` 行里会 byte-shift 成可执行片段。中文只能出现在 `echo` 后面。
+- **根因二**：文件被写成 **LF 行尾**。`cmd.exe` 要 CRLF，纯 LF 时整份脚本会被
+  当成一行乱解析，连 `goto` 标签都失效，表现为直接退回交互式 shell。
+- **修法**：`rem` 全部改 ASCII、中文只留在 `echo` 里、按字节写成纯 CRLF。
+- **实测**：`Start-Process cmd /c 离线刷视频.bat` → **stderr 完全为空**、
+  `/api/state` 200、`/api/library` 174 条、`/player` 200。
+- **回归测试**：新增 `test_offline_bat_is_cmd_safe`——断言纯 CRLF（`lf == crlf`）
+  且每个 `rem` 行 `isascii()`。全量 **352 例通过**。
 
 ## v2.5
 
