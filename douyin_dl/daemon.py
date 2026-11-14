@@ -77,10 +77,16 @@ def guard():
             # 用户重复给了也无妨(argparse 的 store_true 不怕重复)。
             _user_args = [a for a in sys.argv[1:] if a != "--no-open"]
             _child = [_python_exe(), str(MAIN), *_user_args, "--no-open"]
+            # CREATE_NEW_PROCESS_GROUP: 让 Ctrl+C 只发给 daemon, 不连带子进程;
+            # CREATE_NO_WINDOW: 主程序是 pythonw 起的, 再起子进程别弹黑框。
+            _flags = 0
+            if sys.platform == "win32":
+                _flags = (subprocess.CREATE_NEW_PROCESS_GROUP
+                          | getattr(subprocess, "CREATE_NO_WINDOW", 0))
             proc = subprocess.Popen(
                 _child,
                 cwd=str(WORKSPACE),
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0,
+                creationflags=_flags,
             )
         except Exception as e:
             _log(f"[daemon] 启动失败: {e}")

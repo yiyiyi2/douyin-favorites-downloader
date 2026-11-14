@@ -1,8 +1,8 @@
-# 抖音 / 快手 / B站收藏自动下载 · v2.2
+# 抖音 / 快手 / B站收藏自动下载 · v2.2.1
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-2.2.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.2.1-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -167,6 +167,25 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.2.1
+
+**主题：B站下载完会闪一下命令行黑框 —— 子进程都没隐藏窗口。**
+
+- **根因**：主程序是用 `pythonw.exe` 启动的（没有控制台）。Windows 的规则是：
+  **没有控制台的进程再 spawn 子进程，系统会主动给子进程新建一个控制台窗口**。
+  B站下完要调 `ffmpeg` 合并音视频，于是黑框一闪而过。同样会闪的还有 `ffprobe`
+  校验、`yt-dlp` 解析、`powershell` 探测进程。
+- **修复**：在 `core.py` 加了 `run_hidden()` / `popen_hidden()` 两个 helper，统一
+  带上 `CREATE_NO_WINDOW`；把 `bili.merge_av`（ffmpeg）、`core.verify_video`
+  （ffprobe）、`douyin_dl.main`（yt-dlp、powershell）、`watcher.start_chrome`
+  （Chrome）、`ui` 的「在文件夹中显示」（explorer）、`daemon` 拉起子进程全部改走它。
+- **实测对照**（同一台机器，用 `pythonw.exe` 起脚本 + Win32 `EnumWindows` 采样）：
+  修复前裸 `subprocess.run` 期间采样到 **1 个控制台窗口**；修复后走
+  `run_hidden` 全程 **0 个**，且 ffmpeg 合并产出正常、`verify_video` 通过。
+- **回归测试**：新增 `tests/test_no_console_window.py` 6 例 —— 除了锁 helper 行为，
+  还用 AST 静态扫描全部源码，**任何没传 `creationflags` 的裸 `subprocess.run/Popen`
+  都会让测试变红**，防止以后改回去。全量 **296 例通过**。
 
 ## v2.2
 

@@ -430,8 +430,8 @@ def merge_av(video: Path, audio: Path, dest: Path,
     cmd = [ff, "-y", "-i", str(video), "-i", str(audio),
            "-c", "copy", "-movflags", "+faststart", str(dest)]
     try:
-        r = subprocess.run(cmd, capture_output=True, encoding="utf-8",
-                           errors="replace", timeout=600)
+        r = core.run_hidden(cmd, capture_output=True, encoding="utf-8",
+                            errors="replace", timeout=600)
     except Exception as e:                     # noqa: BLE001
         log(f"      ! ffmpeg 调用失败: {str(e)[:80]}")
         return False

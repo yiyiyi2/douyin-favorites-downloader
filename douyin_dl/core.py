@@ -49,6 +49,24 @@ REFERER_KS = "https://www.kuaishou.com/"
 _SAFE = re.compile(r'[\\/:*?"<>|\r\n\t]+')
 _NUM_RE = re.compile(r"-?\d+")
 
+# 主程序用 pythonw.exe 跑(没有控制台)。这种进程里起任何子进程, Windows 都会
+# 给它新开一个控制台窗口 —— 用户看到的就是"下完突然弹个黑框又没了"。
+# ffmpeg 合并音视频、ffprobe 校验、yt-dlp 解析、powershell 探测进程都会闪。
+# 统一加上 CREATE_NO_WINDOW 就能彻底不闪。
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+def run_hidden(cmd, **kw):
+    """跑一个不该弹窗的子进程。所有子进程调用都走这里。"""
+    kw.setdefault("creationflags", _NO_WINDOW)
+    return subprocess.run(cmd, **kw)
+
+
+def popen_hidden(cmd, **kw):
+    """起一个不该弹窗的后台进程。"""
+    kw.setdefault("creationflags", _NO_WINDOW)
+    return subprocess.Popen(cmd, **kw)
+
 
 # --------------------------------------------------------------------------
 # 类型归一化 —— 抖音接口字段的类型说变就变, 这里统一挡一层
@@ -885,7 +903,7 @@ def verify_video(path: Path) -> bool:
         return False
 
     try:
-        out = subprocess.run(
+        out = run_hidden(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=nw=1:nk=1", str(path)],
             capture_output=True, text=True, timeout=30,

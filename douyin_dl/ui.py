@@ -1277,7 +1277,9 @@ class _Handler(BaseHTTPRequestHandler):
                         if not target or not target.exists():
                             continue
                         if target.is_file():
-                            subprocess.Popen(["explorer", "/select,", str(target)])
+                            subprocess.Popen(
+                                ["explorer", "/select,", str(target)],
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                         else:
                             os.startfile(str(target))         # noqa: S606
                         return True

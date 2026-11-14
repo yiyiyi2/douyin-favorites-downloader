@@ -36,6 +36,7 @@ from douyin_dl.core import (
     PLATFORM_KUAISHOU,
     PLATFORM_BILIBILI,
     parse_kuaishou,
+    popen_hidden,
 )
 
 # B站解析要用的小工具(core 里的同名函数是给抖音结构化数据用的,
@@ -2317,7 +2318,7 @@ class BrowserWatcher:
             args.append("--headless=new")
         args.append("about:blank")
 
-        self.proc = subprocess.Popen(
+        self.proc = popen_hidden(
             args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
         for _ in range(80):

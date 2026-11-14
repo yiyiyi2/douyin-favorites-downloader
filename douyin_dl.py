@@ -115,6 +115,7 @@ try:
         parse_any,
         parse_aweme,
         probe_size,
+        run_hidden,
         safe_name,
         verify_video,
         VideoInfo,
@@ -820,8 +821,8 @@ def download_single(url: str, state: State) -> int:
         url,
     ]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=300)
+        r = run_hidden(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=300)
     except FileNotFoundError:
         log("  ! 找不到 yt-dlp, 请先执行: pip install -r requirements.txt")
         return 1
@@ -936,7 +937,7 @@ def _has_live_watcher() -> bool:
             "\"name='python.exe' or name='pythonw.exe'\" | "
             "Select-Object -ExpandProperty CommandLine"
         )
-        out = subprocess.run(
+        out = run_hidden(
             ["powershell.exe", "-NoProfile", "-NonInteractive",
              "-Command", ps],
             capture_output=True, text=True, timeout=12,
