@@ -2154,23 +2154,32 @@ class BrowserWatcher:
         """
         tid = None
         try:
+            tid = self._page_debugger_id(page)
+        except Exception:
+            return False
+        if not tid:
+            return False
+        return self._cdp_probe(tid)
+
+    def _cdp_probe(self, tid):
+        """按 targetId 用 CDP Runtime.evaluate 探活(自带超时), 不依赖 page 对象。
+
+        供「Playwright 看不见的孤儿页」补漏时用 —— 这类页面没有 page 对象,
+        `_page_alive(page)` 无从调用, 只能按 tid 直连 CDP 探一次。
+        """
+        try:
             import websocket as _ws
         except Exception:
-            # 没有 websocket-client 库就跳过探活(当作存活), 退回旧行为,
-            # 靠 _install_hook 里对 "Connection closed" 的黑名单兜底。
             return True
         try:
-            tid = self._page_debugger_id(page)
-            if not tid:
-                return False
             tabs = json.loads(urllib.request.urlopen(
                 f"http://127.0.0.1:{self.port}/json/list", timeout=self._PROBE_TIMEOUT).read())
             ws = next((t.get("webSocketDebuggerUrl") for t in tabs
-                       if t.get("id") == tid), None)
+                       if isinstance(t, dict) and t.get("id") == tid), None)
             if not ws:
                 return False
             conn = _ws.create_connection(ws, timeout=self._PROBE_TIMEOUT,
-                                        enable_multithread=True)
+                                         enable_multithread=True)
             try:
                 conn.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
                                       "params": {"expression": "1", "returnByValue": True}}))
@@ -2309,14 +2318,8 @@ class BrowserWatcher:
                 if self._raw_workers.get(tid) is threading.current_thread():
                     self._raw_workers.pop(tid, None)
 
-    def _ensure_raw_binding(self, page) -> bool:
-        """确保某个 target 有 raw CDP binding 通道在跑。返回是否已就绪。
-
-        关键: Runtime.addBinding 只在「同一条 websocket 连接」存活期间有效,
-        所以必须由 _raw_binding_worker 的长连接来做, 不能用 _raw_cdp 那种
-        发完就关的短连接(短连接一关 binding 就失效)。
-        """
-        tid = self._page_debugger_id(page)
+    def _ensure_raw_binding_by_tid(self, tid: str) -> bool:
+        """按 targetId 确保 raw CDP binding 通道在跑。返回是否已就绪。"""
         if not tid:
             return False
         with self._raw_lock:
@@ -2329,6 +2332,18 @@ class BrowserWatcher:
             self._raw_workers[tid] = t
         t.start()
         return True
+
+    def _ensure_raw_binding(self, page) -> bool:
+        """确保某个 target 有 raw CDP binding 通道在跑。返回是否已就绪。
+
+        关键: Runtime.addBinding 只在「同一条 websocket 连接」存活期间有效,
+        所以必须由 _raw_binding_worker 的长连接来做, 不能用 _raw_cdp 那种
+        发完就关的短连接(短连接一关 binding 就失效)。
+        """
+        tid = self._page_debugger_id(page)
+        if not tid:
+            return False
+        return self._ensure_raw_binding_by_tid(tid)
 
     def _cdp_eval(self, tid, expression):
         """用独立 CDP 对某个 target 做一次 evaluate(半死页也能用)。"""
@@ -2426,8 +2441,16 @@ class BrowserWatcher:
             return False
 
     def _hook_all_pages(self, ctx):
-        """巡检: 给所有健康的站点页装钩子。坏页跳过, 一个坏页不能拖累整轮。"""
+        """巡检: 给所有健康的站点页装钩子。坏页跳过, 一个坏页不能拖累整轮。
+
+        v1.7.2: Playwright 对「从打开起就是半死页」的页面完全看不见 ——
+        它不进 ctx.pages、也不触发 ctx.on("page")。这种页(典型是快手 new-reco
+        页, attach 从 connect_over_cdp 之后才发生且失败)会因此永远装不上钩子、
+        收藏事件全丢。所以这里除了遍历 ctx.pages, 还要直接问 CDP /json/list
+        拿全部 page target, 对 Playwright 漏掉的站点页走纯 CDP 注入 + raw 通道。
+        """
         n = 0
+        # 1) 正常可见页走 Playwright evaluate(快、可靠)
         for pg in list(ctx.pages):
             try:
                 if pg.is_closed():
@@ -2439,6 +2462,48 @@ class BrowserWatcher:
                     n += 1
             except Exception:
                 pass
+        # 2) 补漏: CDP 层里 Playwright 看不见的站点页
+        try:
+            tabs = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/list",
+                timeout=self._PROBE_TIMEOUT).read())
+            pages_by_tid = {}
+            for pg in list(ctx.pages):
+                try:
+                    tid = self._page_debugger_id(pg)
+                except Exception:
+                    tid = None
+                if tid:
+                    pages_by_tid[tid] = pg
+            for t in tabs:
+                if not isinstance(t, dict) or t.get("type") != "page":
+                    continue
+                tid = t.get("id")
+                url = t.get("url") or ""
+                if not tid or not self._is_site_url(url):
+                    continue
+                if tid in pages_by_tid:
+                    continue  # 已经由 _install_hook 处理过
+                # Playwright 看不见的站点页: 直接按 tid 走纯 CDP 通道
+                if self._page_blacklisted(url):
+                    continue
+                if not self._cdp_probe(tid):
+                    self._blacklist(url, "探活无响应")
+                    continue
+                try:
+                    self._ensure_raw_binding_by_tid(tid)
+                    ver = self._cdp_eval(tid, "window.__DY_HOOK_VER__ || 0")
+                    if ver != HOOK_VER:
+                        self._raw_cdp(tid, "Runtime.evaluate",
+                                      {"expression": HOOK_JS}, timeout=8.0)
+                    self._hook_ok = True
+                    self._unblacklist(url)
+                    self.log(f"  · CDP 补漏注入钩子: {url[:50]}")
+                    n += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
         return n
 
     def _scroll_all(self, page):

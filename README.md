@@ -1,8 +1,8 @@
-# 抖音 / 快手收藏自动下载 · v1.7.2
+# 抖音 / 快手收藏自动下载 · v1.7.3
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-1.7.2-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-1.7.3-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -165,6 +165,21 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v1.7.3
+
+**主题：修「快手时好时坏，退出重进就又下不了」—— CDP 补漏注入孤儿半死页。**
+
+- **根因**：快手 `new-reco` 页如果在程序启动**之后**才打开，Playwright 对它的
+  attach 从一开始就失败，它既**不进 `ctx.pages`、也不触发 `ctx.on("page")`**，
+  主程序完全"看不见"它。而 `_hook_all_pages` 只遍历 Playwright 可见的 `ctx.pages`，
+  所以这个页面永远装不上钩子、收藏事件全丢。之前"能下"的场景是快手页在启动时
+  已存在（attach 成功），之后才变半死页，能被 `_install_hook` 看到走 raw 通道。
+- **补漏**：`_hook_all_pages` 现在除了遍历 `ctx.pages`，还直接问 CDP `/json/list`
+  拿全部 page target，对 Playwright 漏掉的站点页走**纯 CDP 注入 + raw binding 通道**
+  （新增 `_cdp_probe(tid)` 按 targetId 探活、`_ensure_raw_binding_by_tid(tid)` 按 tid
+  建通道），不再依赖 page 对象。
+- **回归测试**：新增 1 例（孤儿半死页经 CDP 补漏注入），全量 239 例通过。
 
 ## v1.7.2
 

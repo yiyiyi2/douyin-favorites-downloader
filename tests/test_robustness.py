@@ -777,3 +777,54 @@ def test_ensure_raw_binding_passes_tid_to_worker_thread():
     assert captured.get("name") == f"dy-raw-{tid[:8]}"
     # 注册表里已记录该线程
     assert w._raw_workers.get(tid) is not None
+
+
+def test_hook_all_pages_covers_orphan_halfdead_page_via_cdp():
+    """v1.7.2 回归: Playwright 看不见的孤儿半死页也要经 CDP 补漏注入钩子。
+
+    半死页(从打开起 attach 就失败)不进 ctx.pages、不触发 ctx.on("page"),
+    所以 _hook_all_pages 必须直接问 CDP /json/list 拿全部 page target, 对
+    Playwright 漏掉的站点页走纯 CDP 注入 + raw binding。这里用假 ctx + 假
+    urlopen 模拟这个场景。
+    """
+    w = _make_watcher()
+    tid = "ED1A707AA26C07E7C89EF19F0372AE66"
+    site_url = "https://www.kuaishou.com/new-reco"
+
+    # Playwright 侧完全看不见这个页: ctx.pages 里没有任何对应 page
+    class _Ctx:
+        pages = []
+
+    calls = {"probe": 0, "ensure_raw": 0, "cdp_eval": 0, "raw_inject": 0}
+    w._cdp_probe = lambda t: (calls.__setitem__("probe", calls["probe"] + 1) or True)
+    w._ensure_raw_binding_by_tid = lambda t: (calls.__setitem__("ensure_raw", calls["ensure_raw"] + 1) or True)
+    w._cdp_eval = lambda t, expr: (calls.__setitem__("cdp_eval", calls["cdp_eval"] + 1) or 0)
+    def _raw_cdp(t, method, params=None, timeout=6.0):
+        if method == "Runtime.evaluate":
+            calls["raw_inject"] += 1
+        return {}
+    w._raw_cdp = _raw_cdp
+
+    import urllib.request as _ur, json as _json
+    class _Resp:
+        def read(self):
+            return _json.dumps([
+                {"id": tid, "type": "page", "url": site_url,
+                 "webSocketDebuggerUrl": "ws://x"},
+            ]).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    orig = _ur.urlopen
+    try:
+        _ur.urlopen = lambda *a, **k: _Resp()
+        n = w._hook_all_pages(_Ctx())
+    finally:
+        _ur.urlopen = orig
+
+    assert n == 1
+    assert calls["probe"] == 1
+    assert calls["ensure_raw"] == 1
+    assert calls["cdp_eval"] == 1
+    assert calls["raw_inject"] == 1        # HOOK_JS 通过纯 CDP 注入孤儿页
