@@ -398,6 +398,69 @@ def _load_main():
     return mod
 
 
+def test_downloader_ks_full_path(tmp_path, monkeypatch):
+    """快手完整下载链路: process() 落盘 + 文件名/meta/state/事件 全部走通。
+
+    之前只测到 state.has()==True 的跳过分支, 真正的下载分支没验证过。
+    这里把网络层打桩, 用真实 mp4 魔数落盘, 检查快手 photoId 能贯穿到
+    文件名、_meta 和 state.mark(字母数字混排 id 曾被 _safe_id 拦成空串)。
+    """
+    mod = _load_main()
+    ph = ks_photo()
+    wrapped = {"aweme_id": ph["id"], "_platform": PLATFORM_KUAISHOU, "_ks": ph}
+
+    monkeypatch.setattr(mod, "get_out_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "load_settings", lambda _p: {"quality": "max"})
+    monkeypatch.setattr(mod, "probe_size", lambda session, url: 23089393)
+    monkeypatch.setattr(mod, "verify_video", lambda dest: True)
+
+    def fake_download(session, url, dest, log=None, on_progress=None):
+        # 真 mp4 魔数, 让后续校验逻辑有意义
+        dest.write_bytes(b"\x00\x00\x00\x20ftypisom" + b"\x00" * 4096)
+        return True
+
+    monkeypatch.setattr(mod, "download", fake_download)
+
+    class FakeState:
+        def __init__(self):
+            self.marked = []
+
+        def has(self, _): return False
+
+        def mark(self, aid, dest, res):
+            self.marked.append((aid, dest, res))
+
+    dl = mod.Downloader.__new__(mod.Downloader)
+    dl.session = None
+    dl.state = FakeState()
+    dl.bus = None
+    dl.log = lambda *a, **k: None
+    dl.count_ok = dl.count_skip = dl.count_fail = 0
+    dl._rec_prefetch = {}
+    events = []
+    dl._ev = lambda name, *a: events.append((name, a))
+
+    dl.process(wrapped, "快手收藏")
+
+    assert dl.count_ok == 1 and dl.count_fail == 0
+    assert dl.state.marked and dl.state.marked[0][0] == "3xb42hegyea3mzc"
+    dest = dl.state.marked[0][1]
+    assert dest.suffix == ".mp4" and dest.name.endswith("_3xb42hegyea3mzc.mp4")
+    assert dest.exists()
+    # begin 事件的第一个参数必须也是快手 id(面板据此更新进度)
+    begins = [a for n, a in events if n == "begin"]
+    assert begins and begins[0][0] == "3xb42hegyea3mzc"
+    assert begins[0][1]["quality"] == "960x720"
+    assert [n for n, a in events if n == "finish"] == ["finish"]
+    # _meta 也以 photoId 命名, 且 quality/候选档位写对
+    meta = json.loads((tmp_path / "_meta" / "3xb42hegyea3mzc.json").read_text(
+        encoding="utf-8"))
+    assert meta["aweme_id"] == "3xb42hegyea3mzc"
+    assert meta["author"] == "" or isinstance(meta["author"], str)
+    assert len(meta["all_candidates"]) == 4
+    assert meta["quality"] == "960x720"
+
+
 def test_downloader_submit_caches_ks_for_retry(monkeypatch):
     mod = _load_main()
     mod._KS_LAST.clear()
