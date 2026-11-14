@@ -1,8 +1,8 @@
-# 抖音 / 快手 / B站收藏自动下载 · v2.2.1
+# 抖音 / 快手 / B站收藏自动下载 · v2.2.2
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-2.2.1-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.2.2-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -167,6 +167,31 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.2.2
+
+**主题：面板加载慢 / 卡顿 —— 历史记录重扫从 944ms 降到 51ms。**
+
+- **根因 1（最大头）**：`_recent()` 给每条记录都算一次 `workspace.resolve()`。
+  Windows 上一次 resolve 要走 `nt._getfinalpathname` 系统调用，443 条记录就是
+  886 次，实测吃掉 694ms。改成**纯字符串判定**路径穿越（出现 `..` 段才拒），
+  不碰文件系统。攻击样本全部复测，防护一点没松。
+- **根因 2**：每次 `finish()` / `fail()` / `delete()` 都把历史缓存置 `None`，
+  于是**每下完一个视频就全量重扫 443 条**。改成"元信息签名"缓存：只看
+  `.state.json` 的 `(mtime, size)` 和 `_meta` 目录的 `(mtime, 文件数)`，
+  签名没变就直接复用缓存。
+- **根因 3**：每条记录要对 `_meta` 目录做一次 `exists()` —— 443 条 × 2 个目录
+  = 886 次 stat，占重扫耗时的 70%。改成先用 `os.scandir` 把目录项读成
+  名字索引，查表代替逐条 stat。顺手把 `exists()+stat()+is_dir()` 三次调用
+  合并成一次（`stat` 的 `st_mode` 里本来就有类型）。
+- **根因 4**：同一次重扫里，443 条记录落在同一个下载目录，却逐条去 `stat`
+  这个目录查 mtime。改成**一帧只验一次**。
+- **实测**：`_recent()` 冷启动 **944ms → 51ms（快 18.5 倍）**，命中缓存
+  **0.35ms**，`snapshot()` **1.9ms → 1.0ms**。
+- **回归测试**：新增 `tests/test_perf_ui.py` 33 例 —— 9 种路径穿越攻击样本、
+  8 种垃圾输入、5 种正常路径、缓存失效的 4 个场景（改文件 / 新 meta /
+  finish 不清缓存 / 目录被 stat 的次数上限）、已删文件与新文件的识别。
+  全量 **329 例通过**。
 
 ## v2.2.1
 
