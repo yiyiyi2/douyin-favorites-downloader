@@ -70,12 +70,12 @@ def _cap_set(s: set, limit: int) -> int:
 # writable —— 否则抛 "Invalid property descriptor", 钩子会静默失效。
 # 这个坑踩过一次, 这里保持正确写法。
 # ---------------------------------------------------------------------------
-HOOK_VER = 9   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
+HOOK_VER = 10   # 与 HOOK_JS 里的 const HOOK_VER 保持一致(改钩子逻辑必须同步 +1)
 
 HOOK_JS = r"""
 (() => {
   // 版本号: 改动钩子逻辑就 +1, 否则页面里的旧版本会靠守卫把新版本挡掉(踩过坑)
-  const HOOK_VER = 9;
+  const HOOK_VER = 10;
   if (window.__DY_HOOK_VER__ === HOOK_VER) return;
   // 需要搭便车的接口
   const DATA_EP = [
@@ -121,13 +121,18 @@ HOOK_JS = r"""
   const pickKs = (s) => { const m = s && s.match(KS_RE); return m ? m[1] : ""; };
 
   const idFromNode = (el) => {
+    // v1.7: 下面的循环都会改 el(往上爬), 必须先把「原始点击元素」存一份。
+    // 否则第 1 步走完 el 已经变成 null/document, 第 2/3 步从那个位置开始
+    // 等于什么都没查 —— 抖音靠第 1 步的 data-e2e-vid 能命中所以没暴露,
+    // 快手没有这个属性, 点击事件的 id 就会永远是空(踩过坑)。
+    const start = el;
     // 1) 抖音详情页的播放容器上有 data-e2e-vid, 这是最可靠的
     for (let i = 0; i < 12 && el; i++, el = el.parentElement) {
       const v = el.getAttribute && el.getAttribute("data-e2e-vid");
       if (v) return v;
     }
     // 2) v1.7 快手: 卡片上常挂 data-photo-id / data-video-id, 第 1 步认不到时试这里
-    let k = el;
+    let k = start;
     for (let i = 0; i < 12 && k; i++, k = k.parentElement) {
       if (!k.getAttribute) continue;
       const pid = k.getAttribute("data-photo-id") || k.getAttribute("data-video-id");
@@ -136,8 +141,8 @@ HOOK_JS = r"""
       const kh = pickKs(href);
       if (kh) return kh;
     }
-    // 3) 退而求其次: 往上找带 id 的属性 / 链接 / data-e2e
-    let n = el;
+    // 3) 退而求其次: 往上找带 id 的属性 / 链接 / data-e2e(同样从原始元素开始)
+    let n = start;
     for (let i = 0; i < 12 && n; i++, n = n.parentElement) {
       const a = (n.getAttribute && (n.getAttribute("data-e2e") || "")) || "";
       const id = n.getAttribute && (n.getAttribute("data-id") || n.getAttribute("data-aweme-id"));

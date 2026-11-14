@@ -425,6 +425,24 @@ def test_refetch_ks_cache_miss_returns_none_without_douyin_fetch(monkeypatch):
     assert called == []                                # 不能拿 photoId 开抖音详情页
 
 
+def test_hook_smoke_real_browser():
+    """真浏览器注入 HOOK_JS: 用子进程跑, 避开 pytest-asyncio 的事件循环冲突。"""
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, str(_ROOT / "tests" / "hook_smoke.py")],
+        cwd=str(_ROOT), capture_output=True, timeout=90,
+        # Windows 下 subprocess 默认拿 locale(GBK) 解码子进程输出, 而子进程
+        # 按 PYTHONIOENCODING 写的是 utf-8 —— 不显式指定就会 UnicodeDecodeError。
+        encoding="utf-8", errors="replace",
+        env={**__import__("os").environ, "PYTHONIOENCODING": "utf-8"},
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode == 2:
+        import pytest
+        pytest.skip("系统 Chrome 不可用, 跳过钩子注入冒烟")
+    assert r.returncode == 0, out[-1500:]
+
+
 def test_downloader_process_uses_parse_any(monkeypatch):
     """快手包装对象进 process 时, parse_any 生效且画质/文件名逻辑能跑。"""
     mod = _load_main()
