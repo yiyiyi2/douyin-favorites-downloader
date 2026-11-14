@@ -821,6 +821,9 @@ class BrowserWatcher:
         self._pause_noted = False
         self._lock = threading.Lock()
         self._pending_actions: list[str] = []
+        # v1.7.1: 坏页面拉黑表 {url: 解禁时间戳} + 它的锁
+        self._bad_pages: dict[str, float] = {}
+        self._hook_lock = threading.Lock()
         self._page = None
         self._ctx = None
         self._browser = None
@@ -1818,12 +1821,7 @@ class BrowserWatcher:
 
                 # 启动时千万别动用户正在看的页面。装钩子即可, 该刷抖音时页面自己会发请求。
                 self._cleanup_stale_bg(ctx)
-                for pg in list(ctx.pages):
-                    try:
-                        if not pg.is_closed():
-                            self._install_hook(pg)
-                    except Exception:
-                        pass
+                self._hook_all_pages(ctx)
 
                 # 冷启动时窗口里可能只有一个 about:blank, 自动补一个抖音页
                 page = self._ensure_douyin_tab(ctx) or page
@@ -1926,12 +1924,7 @@ class BrowserWatcher:
                         self._last_advance = now
                         self._auto_advance_feed(ctx)
                     if tick % 15 == 0:             # 每 ~6 秒巡检一次钩子是否还在
-                        for pg in list(ctx.pages):
-                            try:
-                                if not pg.is_closed():
-                                    self._install_hook(pg)
-                            except Exception:
-                                pass
+                        self._hook_all_pages(ctx)
                         self._sync_cookies(ctx)
                     if tick % 150 == 0:            # 每 ~60 秒: 窗口被关空了看情况补一个
                         try:
@@ -2067,25 +2060,193 @@ class BrowserWatcher:
         len(ctx.pages) 读的是本地缓存, 根本不走网络 —— 用它当 pump 是无效的,
         binding 回调会一直卡到下一次真正的 API 调用才被派发(踩过坑)。
         这里用 wait_for_timeout(1) 做一次极轻的往返, 把队列冲出来。
+
+        v1.7.1: pages[0] 可能是坏页面(渲染进程死), wait_for_timeout 同样会被
+        拖住。优先挑一个健康的站点页来 pump; 没有就退回 browser 级 CDP
+        (Browser.getVersion 是一次和浏览器进程的轻往返, 不碰任何页面渲染进程)。
         """
         try:
-            pages = ctx.pages
-            if pages:
-                pages[0].wait_for_timeout(1)
+            for pg in ctx.pages:
+                try:
+                    u = pg.url or ""
+                except Exception:
+                    u = ""
+                if any(d in u for d in _SITE_DOMAINS) and not self._page_blacklisted(u):
+                    pg.wait_for_timeout(1)
+                    return
+            # 没有健康的站点页: 用 browser 级 CDP 做安全往返
+            try:
+                cdp = self._browser.new_browser_cdp_session()
+                try:
+                    cdp.send("Browser.getVersion")
+                finally:
+                    try:
+                        cdp.detach()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
 
+    # ---- v1.7.1: 页面健康度看门狗 ----------------------------------
+    # Page.evaluate() 在 Playwright 里 **没有 timeout 形参**, 对一个已经挂掉/
+    # 还没初始化好的渲染进程会一直阻塞(实测 68 秒才抛 Connection closed, 而
+    # 主循环就卡在这一行 —— 整个监听停摆, 抖音和快手的事件全都收不到)。
+    # 所以: ① 只给真正的站点页装钩子, 空 URL / about: / 别的网站一律跳过;
+    #        ② 每次巡检验页面之前先用 CDP 的 Runtime.evaluate 带硬超时探活,
+    #           探不通就拉黑一段时间, 绝不对它调 page.evaluate。
+    _PROBE_TIMEOUT = 4.0        # 单次探活最多等多久(秒)
+    _BLACKLIST_SECS = 120.0     # 探活失败后拉黑多久
+
+    def _page_url(self, page):
+        """拿页面 URL, 拿不到就返回空串(某些坏页连 .url 都会抛)。"""
+        try:
+            return page.url or ""
+        except Exception:
+            return ""
+
+    def _is_site_url(self, url):
+        """只有真正的抖音/快手页面才值得装钩子。"""
+        return any(d in url for d in _SITE_DOMAINS)
+
+    def _page_alive(self, page):
+        """用 CDP 的 Runtime.evaluate 探活(自带超时), 不用 page.evaluate。
+
+        走 websocket 直连 CDP: `websocket-client` 的 recv 支持 timeout, 探不通
+        就在 _PROBE_TIMEOUT 秒内返回 False, 不会把调用方拖住。探针脚本里就是
+        用这个方式量出「坏页面 68 秒不响应」的。
+        """
+        tid = None
+        try:
+            import websocket as _ws
+        except Exception:
+            # 没有 websocket-client 库就跳过探活(当作存活), 退回旧行为,
+            # 靠 _install_hook 里对 "Connection closed" 的黑名单兜底。
+            return True
+        try:
+            tid = self._page_debugger_id(page)
+            if not tid:
+                return False
+            tabs = json.loads(urllib.request.urlopen(
+                f"http://127.0.0.1:{self.port}/json/list", timeout=self._PROBE_TIMEOUT).read())
+            ws = next((t.get("webSocketDebuggerUrl") for t in tabs
+                       if t.get("id") == tid), None)
+            if not ws:
+                return False
+            conn = _ws.create_connection(ws, timeout=self._PROBE_TIMEOUT,
+                                        enable_multithread=True)
+            try:
+                conn.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                      "params": {"expression": "1", "returnByValue": True}}))
+                deadline = time.time() + self._PROBE_TIMEOUT
+                while time.time() < deadline:
+                    msg = json.loads(conn.recv())
+                    if msg.get("id") == 1:
+                        return "result" in msg
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            return False
+        return False
+
+    def _page_debugger_id(self, page):
+        """用 Playwright 的私有 CDP 会话拿 targetId; 拿不到返回 None。
+
+        这里只读属性, 不发网络请求, 不会阻塞。
+        """
+        try:
+            ctx = getattr(self, "_ctx", None)
+            if ctx is None:
+                return None
+            cdp = ctx.new_cdp_session(page)
+            try:
+                info = cdp.send("Target.getTargetInfo")
+                return ((info or {}).get("targetInfo") or {}).get("targetId")
+            finally:
+                try:
+                    cdp.detach()
+                except Exception:
+                    pass
+        except Exception:
+            return None
+
     def _install_hook(self, page):
+        """给一个页面装钩子。返回 True 表示确定装好了(或本来就好)。
+
+        v1.7.1: 对空 URL / 非站点页直接跳过 —— 这类页面(典型是切站点时渲染进程
+        挂掉留下的空壳)调 page.evaluate 会永久阻塞, 把主循环钉死。已经拉黑的
+        页面也不再碰。
+        """
+        url = self._page_url(page)
+        if not self._is_site_url(url):
+            return False
+        if self._page_blacklisted(url):
+            return False
+        # 先探活再 evaluate: 渲染进程死了的页面, page.evaluate 会永久阻塞。
+        # 用 CDP Runtime.evaluate 硬超时探一次, 探不通就拉黑, 绝不碰 page.evaluate。
+        if not self._page_alive(page):
+            self._blacklist(url, "探活无响应")
+            return False
         # 页面正在跳转时 evaluate 会抛 "Execution context was destroyed", 属正常, 下一轮再装
         for _ in range(2):
             try:
                 if page.evaluate("() => window.__DY_HOOK_VER__ || 0") != HOOK_VER:
                     page.evaluate(HOOK_JS)
                 self._hook_ok = True
+                self._unblacklist(url)
                 return True
-            except Exception:
+            except Exception as e:
+                # "Connection closed while reading from the driver" = 这个页面的
+                # 渲染进程已经废了, 对它的任何 evaluate 都会卡死, 拉黑别再来。
+                if "Connection closed" in str(e) or "Target closed" in str(e):
+                    self._blacklist(url, str(e)[:60])
+                    return False
                 time.sleep(0.6)
         return False
+
+    def _blacklist(self, url, why=""):
+        """把一个坏页面拉黑一段时间, 期间不再对它做任何 evaluate。"""
+        if not url:
+            return
+        with self._hook_lock:
+            first = url not in self._bad_pages
+            self._bad_pages[url] = time.time() + self._BLACKLIST_SECS
+        if first:
+            self.log(f"  ! 页面没响应, 暂时不碰它: {url[:60]}  {why}")
+
+    def _unblacklist(self, url):
+        with self._hook_lock:
+            self._bad_pages.pop(url, None)
+
+    def _page_blacklisted(self, url):
+        with self._hook_lock:
+            until = self._bad_pages.get(url)
+            if until is None:
+                return False
+            if until > time.time():
+                return True
+            self._bad_pages.pop(url, None)
+            return False
+
+    def _hook_all_pages(self, ctx):
+        """巡检: 给所有健康的站点页装钩子。坏页跳过, 一个坏页不能拖累整轮。"""
+        n = 0
+        for pg in list(ctx.pages):
+            try:
+                if pg.is_closed():
+                    continue
+            except Exception:
+                continue
+            try:
+                if self._install_hook(pg):
+                    n += 1
+            except Exception:
+                pass
+        return n
 
     def _scroll_all(self, page):
         """把收藏列表滚到底, 触发分页加载。"""

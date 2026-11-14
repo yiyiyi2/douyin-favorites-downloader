@@ -30,6 +30,9 @@ MAX_RAPID = 5
 RESTART_DELAY = 5
 # 下载进程用这个退出码表示「用户主动关闭, 不要拉起」(如面板里关了自动重开、用户关掉全部抖音页)
 EXIT_INTENTIONAL = 7
+# 退出码 3 = 「已经有一个下载进程在运行了」—— 这是用户在运行期间又双击了一次
+# 启动收藏下载.bat, 属于正常操作, 绝不能当作「秒退」累计; 否则连点 5 次就把守护判死。
+EXIT_ALREADY_RUNNING = 3
 
 
 def _log(msg: str) -> None:
@@ -101,6 +104,13 @@ def guard():
         if code == EXIT_INTENTIONAL:
             _log("[daemon] 用户主动关闭(关掉了抖音且自动重开=关), 守护退出。"
                  "下次双击 启动收藏下载.bat 再开始。")
+            return
+
+        if code == EXIT_ALREADY_RUNNING:
+            # 已经有一个下载进程在跑(用户又双击了一次启动.bat), 这不是故障。
+            # 真正的守护进程一定还在另一个父进程里活着, 这里静默退出即可,
+            # 不累计秒退、不影响那个正在运行的守护。
+            _log("[daemon] 已经有一个下载进程在运行, 本次启动的守护不再重复守护并退出。")
             return
 
         if lived >= RAPID_EXIT_SECS:

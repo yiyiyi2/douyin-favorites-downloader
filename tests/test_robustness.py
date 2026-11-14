@@ -532,3 +532,131 @@ def test_requeue_clears_stale_failed_entry():
     bus.add_waiting(aid, source="解析中")
     assert aid not in bus.failed          # 旧失败记录被摘掉
     assert any(x["id"] == aid for x in bus.waiting)
+
+
+# ---------------------------------------------------------------------------
+# 6. v1.7.1: 坏页面看门狗 (Page.evaluate 对坏页永久阻塞, 把主循环钉死)
+# ---------------------------------------------------------------------------
+def _make_watcher():
+    return BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()), log=lambda m: None)
+
+
+def test_install_hook_skips_non_site_and_blank_urls():
+    """空 URL / 非站点页绝不能碰 page.evaluate —— 这类页面会永久阻塞主循环。"""
+    w = _make_watcher()
+
+    class _Blank:
+        url = ""
+        def evaluate(self, *_a, **_k): raise AssertionError("不该对空 URL 调 evaluate")
+    class _About:
+        url = "about:blank"
+        def evaluate(self, *_a, **_k): raise AssertionError("不该对 about: 调 evaluate")
+    class _Other:
+        url = "https://example.com/foo"
+        def evaluate(self, *_a, **_k): raise AssertionError("不该对非站点页调 evaluate")
+
+    for pg in (_Blank(), _About(), _Other()):
+        assert w._install_hook(pg) is False
+
+
+def test_install_hook_probe_dead_page_blacklists_without_evaluate():
+    """探活失败(渲染进程死)的站点页要拉黑, 且绝不调用 page.evaluate。"""
+    w = _make_watcher()
+    site_url = "https://www.kuaishou.com/new-reco"
+    calls = {"evaluate": 0}
+
+    class _DeadSite:
+        url = site_url
+        def evaluate(self, *_a, **_k):
+            calls["evaluate"] += 1
+            raise AssertionError("探活没通过就不该 evaluate")
+
+    # 探活走 CDP, 这里用假实现直接返回 False(模拟渲染进程无响应)
+    w._page_alive = lambda page: False
+    assert w._install_hook(_DeadSite()) is False
+    assert calls["evaluate"] == 0
+    assert w._page_blacklisted(site_url) is True
+
+
+def test_install_hook_unblacklists_after_success():
+    """evaluate 成功装好钩子后要解禁该 URL(清掉任何残留的拉黑记录)。"""
+    w = _make_watcher()
+    site_url = "https://www.douyin.com/?recommend=1"
+    # 注意: 已在拉黑期的页面, _install_hook 开头就会 return False, 根本走不到
+    # 探活; 解禁只发生在「拉黑过期后重新探活成功」这一路。这里直接断言成功路径
+    # 会清掉记录、返回 True。
+    w._page_alive = lambda page: True
+
+    class _GoodSite:
+        url = site_url
+        def evaluate(self, js=None, *_a, **_k):
+            if js == "() => window.__DY_HOOK_VER__ || 0":
+                return 10                      # 与 HOOK_VER 相等, 不重装
+            raise AssertionError("不该再装 HOOK_JS")
+    assert w._install_hook(_GoodSite()) is True
+    assert w._page_blacklisted(site_url) is False
+
+
+def test_install_hook_skips_still_blacklisted_page():
+    """拉黑期内的站点页直接跳过(不探活、不 evaluate), 等过期后再看。"""
+    w = _make_watcher()
+    site_url = "https://www.kuaishou.com/new-reco"
+    w._bad_pages[site_url] = time.time() + 60
+    probed = {"n": 0}
+    w._page_alive = lambda page: (probed.__setitem__("n", probed["n"] + 1) or True)
+
+    class _Site:
+        url = site_url
+        def evaluate(self, *_a, **_k):
+            raise AssertionError("拉黑期内不该 evaluate")
+    assert w._install_hook(_Site()) is False
+    assert probed["n"] == 0                    # 连探活都省了
+
+
+def test_pump_prefers_healthy_site_page_over_bad_first_page():
+    """pump 要跳过坏页/非站点页, 挑一个健康的站点页来派发事件, 而不是永远 pages[0]。"""
+    w = _make_watcher()
+    events = []
+
+    class _Bad:
+        url = ""
+        def wait_for_timeout(self, *_a, **_k):
+            raise AssertionError("不该对空 URL 页 wait_for_timeout")
+    class _Good:
+        url = "https://www.douyin.com/?recommend=1"
+        def wait_for_timeout(self, ms):
+            events.append(ms)
+
+    class _Ctx:
+        pages = [_Bad(), _Good()]
+
+    w.pump(_Ctx())
+    assert events == [1]
+
+
+def test_pump_falls_back_to_browser_cdp_when_no_site_page():
+    """一个站点页都没有时, 退回 browser 级 CDP 派发事件, 而不是卡死。"""
+    w = _make_watcher()
+    got = {"version": False}
+
+    class _Cdp:
+        def send(self, method):
+            if method == "Browser.getVersion":
+                got["version"] = True
+                return {}
+            raise AssertionError(f"意外方法 {method}")
+        def detach(self):
+            pass
+    class _Browser:
+        def new_browser_cdp_session(self):
+            return _Cdp()
+    class _Other:
+        url = "https://example.com/x"
+        def wait_for_timeout(self, *_a, **_k):
+            raise AssertionError("不该对非站点页 wait_for_timeout")
+    class _Ctx:
+        pages = [_Other()]
+
+    w._browser = _Browser()
+    w.pump(_Ctx())
+    assert got["version"] is True
