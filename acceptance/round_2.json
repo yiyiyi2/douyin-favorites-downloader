@@ -1,0 +1,573 @@
+{
+  "round": 2,
+  "started_at": "2026-11-13 21:05:08",
+  "finished_at": "2026-11-13 21:05:34",
+  "duration_s": 25.96,
+  "env": {
+    "version": "1.7.0",
+    "hook_ver": 10,
+    "cwd": "C:\\Users\\xieyihao\\Desktop\\dsh\\douyin下载",
+    "python": "3.12.0"
+  },
+  "evidence": {
+    "video_server_port": 63244,
+    "tmp_workspace": "C:\\Users\\xieyihao\\AppData\\Local\\Temp\\dy_acc_r2_90xz3xi0",
+    "processes_sample": [
+      {
+        "ProcessId": 31168,
+        "Name": "pythonw.exe",
+        "ParentProcessId": 30760
+      },
+      {
+        "ProcessId": 27344,
+        "Name": "pythonw.exe",
+        "ParentProcessId": 31168
+      },
+      {
+        "ProcessId": 20468,
+        "Name": "chrome.exe",
+        "ParentProcessId": 27344
+      },
+      {
+        "ProcessId": 29172,
+        "Name": "chrome.exe",
+        "ParentProcessId": 20468
+      },
+      {
+        "ProcessId": 9316,
+        "Name": "chrome.exe",
+        "ParentProcessId": 20468
+      },
+      {
+        "ProcessId": 29628,
+        "Name": "chrome.exe",
+        "ParentProcessId": 20468
+      },
+      {
+        "ProcessId": 18264,
+        "Name": "chrome.exe",
+        "ParentProcessId": 20468
+      },
+      {
+        "ProcessId": 14500,
+        "Name": "chrome.exe",
+        "ParentProcessId": 20468
+      },
+      {
+        "ProcessId": 31784,
+        "Name": "powershell.exe",
+        "ParentProcessId": 32624
+      }
+    ],
+    "pytest": "........................................................................ [ 31%]\r\n........................................................................ [ 63%]\r\n........................................................................ [ 94%]\r\n............                                                             [100%]\r\n228 passed in 6.53s\r\nD:\\软件\\python\\Lib\\site-packages\\pytest_asyncio\\plugin.py:207: PytestDeprecationWarning: The configuration option \"asyncio_default_fixture_loop_scope\" is unset.\r\nThe event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: \"function\", \"class\", \"module\", \"package\", \"session\"\r\n\r\n  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))",
+    "git_status": "?? acceptance/",
+    "git_head": "2fa5afd test: 补快手完整下载链路回归 + 同步 README 测试数"
+  },
+  "categories": [
+    {
+      "name": "A · 解析器 / 双平台数据形状 / 画质选择 / 文件名 / 校验",
+      "checks": [
+        {
+          "name": "抖音 parse_aweme: 3 档里过滤掉 playwm 水印档, 选 1080x1920 最高码率",
+          "ok": true,
+          "detail": "id=7705427599274719717 候选=2 best=1080x1920 br=5000000",
+          "ms": 0
+        },
+        {
+          "name": "快手 parse_kuaishou (REST): 遍历 manifest+manifestH265, 平级 author 合并, 毫秒时间戳折秒",
+          "ok": true,
+          "detail": "合并=1 候选=4 best=960x720 br=2006 author=义沉沉 dur=92066 ts=1789307548",
+          "ms": 0
+        },
+        {
+          "name": "快手 parse_kuaishou (Apollo 详情页): id 解引用 + backupUrl json 壳剥开",
+          "ok": true,
+          "detail": "Apollo type:id/type:json 解引用 -> best=1080x1920 br=5000 候选=2",
+          "ms": 0
+        },
+        {
+          "name": "parse_any 双平台分派: 包装对象走快手, 原生对象走抖音",
+          "ok": true,
+          "detail": "快手=3xb42hegyea3mzc/4 抖音=7705427599274719717/2",
+          "ms": 0
+        },
+        {
+          "name": "is_kuaishou_id: 字母数字混排放行, 纯数字抖音 id / 短串拒绝",
+          "ok": true,
+          "detail": "KS_AID=True DY_AID=False",
+          "ms": 0
+        },
+        {
+          "name": "_safe_id: 快手字母数字 id 放行, 路径穿越/点/中文/空格全部拦掉",
+          "ok": true,
+          "detail": "合法=True 穿越全部拦掉=True",
+          "ms": 0
+        },
+        {
+          "name": "build_filename: 日期_作者_标题_id, 不含扩展名, 快手 id 完整保留",
+          "ok": true,
+          "detail": "stem=20260913_义沉沉_云野云峰下雨打雷该怎么玩 #光遇_3xb42hegyea3mzc",
+          "ms": 1
+        },
+        {
+          "name": "verify_video: MP4/WebM/FLV/AVI 魔数全认, <512 字节与 HTML 判假",
+          "ok": true,
+          "detail": "mp4:T webm:T flv:T avi:T tiny:F html:F",
+          "ms": 301
+        },
+        {
+          "name": "filter_candidates: max 全量; 限制档位无候选时回退全量(不会没得下)",
+          "ok": true,
+          "detail": "max=4 480(过滤后空则回退全量)=4",
+          "ms": 0
+        },
+        {
+          "name": "设置夹取: auto_gap 1~60, 画质选项含最高画质",
+          "ok": true,
+          "detail": "clamp(0)=1.0 clamp(999)=60.0",
+          "ms": 0
+        },
+        {
+          "name": "build_session: 带 UA/Referer, 不放全局 Range(v1.6 断点 bug 回归)",
+          "ok": true,
+          "detail": "headers=['accept', 'accept-encoding', 'accept-language', 'connection', 'referer', 'user-agent']",
+          "ms": 0
+        },
+        {
+          "name": "Candidate.score 三元组 (面积, 码率, 体积) 取 max",
+          "ok": true,
+          "detail": "score=((8294400, 9999999, 50000000)) > ((2073600, 5000000, 30000000))",
+          "ms": 0
+        }
+      ]
+    },
+    {
+      "name": "B · 双站点事件管线 (收藏/取消/列表基线/推荐页/路由隔离)",
+      "checks": [
+        {
+          "name": "快手: feed 缓存 → 收藏 collect=1 命中缓存, 零延迟直接下载(不重抓)",
+          "ok": true,
+          "detail": "缓存=True 直接提交=1 pending=[]",
+          "ms": 0
+        },
+        {
+          "name": "快手: collect=2 取消收藏不下载, 并撤掉未开始抓的 pending",
+          "ok": true,
+          "detail": "calls=[] pending=[]",
+          "ms": 0
+        },
+        {
+          "name": "快手: 没带 collect 的状态同步请求被忽略(不误下)",
+          "ok": true,
+          "detail": "calls=[] pending=[] logs=['  · 忽略快手状态同步请求 3xb42hegyea3mzc (没有 collect)']",
+          "ms": 0
+        },
+        {
+          "name": "快手: 冷启动无缓存走 on_pending 占位 + 无头详情兜底",
+          "ok": true,
+          "detail": "pending=['3xb42hegyea3mzc'] logs=['  · 新收藏 3xb42hegyea3mzc (快手), 正在抓取最新视频信息…']",
+          "ms": 0
+        },
+        {
+          "name": "快手: /rest/v/collect/list 只建基线, 重复刷新也绝不触发下载",
+          "ok": true,
+          "detail": "baseline=True known=1 calls=0",
+          "ms": 0
+        },
+        {
+          "name": "快手: 开了 download_all_on_start 才回补收藏列表",
+          "ok": true,
+          "detail": "calls=[('3xb42hegyea3mzc', '快手收藏列表')]",
+          "ms": 0
+        },
+        {
+          "name": "快手: auto_recommend 开启后推荐流去重提交「快手推荐」(不重抓)",
+          "ok": true,
+          "detail": "提交次数=1 sources=['快手推荐']",
+          "ms": 0
+        },
+        {
+          "name": "抖音: 收藏 action=1 → on_pending 占位 + 进补全队列(每次重抓详情)",
+          "ok": true,
+          "detail": "缓存=True pending=['7705427599274719717'] 直接提交=0",
+          "ms": 0
+        },
+        {
+          "name": "抖音: action=0 取消收藏不下载并撤 pending",
+          "ok": true,
+          "detail": "pending=[] calls=0",
+          "ms": 0
+        },
+        {
+          "name": "抖音: 无 action 的状态同步请求被忽略(早期 action=1/0 判反的回归)",
+          "ok": true,
+          "detail": "pending=[] logs=['  · 忽略状态同步请求 7705427599274719717 (没有 action)']",
+          "ms": 0
+        },
+        {
+          "name": "抖音: 收藏列表第一页建基线; cursor!=0 的翻页不算第一页, 不误下",
+          "ok": true,
+          "detail": "baseline=True known=1 calls=0",
+          "ms": 0
+        },
+        {
+          "name": "抖音: auto_recommend 下 /tab/feed 提交「推荐页」(走详情重抓)",
+          "ok": true,
+          "detail": "calls=[('7705427599274719717', '推荐页')]",
+          "ms": 0
+        },
+        {
+          "name": "路由隔离: _is_ks_url 分流, 快手流量不进抖音分支、抖音流量不进快手分支",
+          "ok": true,
+          "detail": "no_dy=True no_ks=True",
+          "ms": 0
+        },
+        {
+          "name": "快手解析辅助: collect 1/2 语义 + photoId 抽取 + 详情页 URL 取 id",
+          "ok": true,
+          "detail": "",
+          "ms": 0
+        }
+      ]
+    },
+    {
+      "name": "C · 真实下载链路 (本地 HTTP 服务器跑 core.download 全链路)",
+      "checks": [
+        {
+          "name": "core.download 完整下载: 字节完全一致, .part 正常改名无残留",
+          "ok": true,
+          "detail": "ok=True size=8012",
+          "ms": 29
+        },
+        {
+          "name": "core.download 断点续传: .part 半截 → Range 206 → 拼回完整文件",
+          "ok": true,
+          "detail": "断点起点=4006 ok=True 最终=8012",
+          "ms": 19
+        },
+        {
+          "name": "core.download 中途断连: 留 .part 自动重试续传, 不留半截坏文件",
+          "ok": true,
+          "detail": "ok=True size=8012",
+          "ms": 1521
+        },
+        {
+          "name": "core.download 416 + 非空 .part: 判定已下完整, 直接落盘成功",
+          "ok": true,
+          "detail": "ok=True",
+          "ms": 12
+        },
+        {
+          "name": "core.download 416 + 空 .part: 删掉空断点重下, 不永久卡死",
+          "ok": true,
+          "detail": "ok=False 空断点已删=True",
+          "ms": 25
+        },
+        {
+          "name": "core.download 登录页/JSON 响应: Content-Type 判假, 不把网页当视频存",
+          "ok": true,
+          "detail": "html=False json=False",
+          "ms": 8
+        },
+        {
+          "name": "core.download 内容嗅探: 伪装 ctype 但首块是 HTML 也要拦下",
+          "ok": true,
+          "detail": "ok=False 首块 <!DOCTYPE 被嗅探拦下",
+          "ms": 5
+        },
+        {
+          "name": "core.probe_size: 只读 Content-Range 的 /总长, 不下整段视频",
+          "ok": true,
+          "detail": "probe_size=8012 期望=8012",
+          "ms": 1
+        },
+        {
+          "name": "真实下载落盘文件通过 verify_video 校验",
+          "ok": true,
+          "detail": "verify_video(真实落盘文件)=True",
+          "ms": 60
+        }
+      ]
+    },
+    {
+      "name": "D · Downloader.process 全链路 (解析→选画质→落盘→meta→状态→事件)",
+      "checks": [
+        {
+          "name": "快手完整落盘链路: count_ok / 文件名含字母数字 id / _meta / begin+finish+set_speed",
+          "ok": true,
+          "detail": "ok=1 落盘=['20260913_义沉沉_云野云峰下雨打雷该怎么玩 #光遇_3xb42hegyea3mzc.mp4'] meta=True 事件=['begin', 'progress', 'set_speed', 'finish']",
+          "ms": 23
+        },
+        {
+          "name": "抖音完整落盘链路: parse_aweme → 选 1080p → 落盘 → 状态登记",
+          "ok": true,
+          "detail": "ok=1 落盘=['20260913_测试作者_测试抖音视频 验收用_7705427599274719717.mp4']",
+          "ms": 5
+        },
+        {
+          "name": "已下载去重: state.has() 命中走 skip, 不重复下载",
+          "ok": true,
+          "detail": "skip=1 ok=0",
+          "ms": 0
+        },
+        {
+          "name": "submit: 快手对象写进 _KS_LAST(重试零网络) + 入队 + 面板占位",
+          "ok": true,
+          "detail": "_KS_LAST=True 入队来源=快手收藏",
+          "ms": 0
+        },
+        {
+          "name": "快手重试: 命中 _KS_LAST 零网络返回, 绝不拿 photoId 去开抖音 /video/",
+          "ok": true,
+          "detail": "命中缓存=True 误开抖音详情页次数=0",
+          "ms": 0
+        }
+      ]
+    },
+    {
+      "name": "E · 面板 EventBus 状态机 (队列 / 进度 / 失败 / 重试 / 忽略 / 快照)",
+      "checks": [
+        {
+          "name": "snapshot: 21 个键齐全(面板所有区块的数据源)",
+          "ok": true,
+          "detail": "snapshot 键数=21 缺=[]",
+          "ms": 0
+        },
+        {
+          "name": "add_waiting: 同 id「解析中」占位就地补全标题/作者/来源, 不产生重复行",
+          "ok": true,
+          "detail": "waiting=[{'id': '3xb42hegyea3mzc', 'title': '标题来了', 'author': '作者来了', 'source': '快手收藏', 'at': 1794575110}]",
+          "ms": 0
+        },
+        {
+          "name": "begin/progress: 从 waiting 移到 active, 进度百分比写入",
+          "ok": true,
+          "detail": "active={'id': '3xb42hegyea3mzc', 'title': 'T', 'author': 'A', 'cover': '', 'quality': '960x720', 'total': 1000, 'done': 500, 'pct': 50.0, 'speed': 0.0, 'phase': 'downloading', 'started': 1794575110.553861}",
+          "ms": 1
+        },
+        {
+          "name": "finish(ok): 成功计数 +1 并移出 active",
+          "ok": true,
+          "detail": "counters={'ok': 1, 'skip': 0, 'fail': 0}",
+          "ms": 0
+        },
+        {
+          "name": "fail / set_speed: 失败项进列表, 峰值速度记录",
+          "ok": true,
+          "detail": "failed=['3xb42hegyea3mzc'] max_speed=9.5",
+          "ms": 0
+        },
+        {
+          "name": "retry: 受理立刻标「重试中」(面板零延迟反馈), 后台成功自动摘除",
+          "ok": true,
+          "detail": "ok=True 立刻标 retrying=True 回调=3xb42hegyea3mzc 已摘除=True",
+          "ms": 51
+        },
+        {
+          "name": "dismiss: 叉掉失败项, 只动内存不碰文件/state",
+          "ok": true,
+          "detail": "dismiss=True 剩余=[]",
+          "ms": 0
+        },
+        {
+          "name": "subscribe/publish/unsubscribe: SSE 客户端能收到最新快照且可注销",
+          "ok": true,
+          "detail": "收到快照键数=21",
+          "ms": 1
+        },
+        {
+          "name": "skip: 已存在/已下载计数 +1",
+          "ok": true,
+          "detail": "counters={'ok': 1, 'skip': 1, 'fail': 0}",
+          "ms": 0
+        }
+      ]
+    },
+    {
+      "name": "F · 真实运行面板 HTTP (127.0.0.1:8899, 只读 + 无副作用写)",
+      "checks": [
+        {
+          "name": "GET / : 面板 HTML 正常返回 (no-store, >2KB)",
+          "ok": true,
+          "detail": "status=200 len=49662 ctype=text/html; charset=utf-8",
+          "ms": 1
+        },
+        {
+          "name": "GET /index.html : 显式路径同样返回面板",
+          "ok": true,
+          "detail": "status=200 len=49662",
+          "ms": 1
+        },
+        {
+          "name": "GET /api/state : 21 键, running=True, 浏览器已连接",
+          "ok": true,
+          "detail": "status=200 键数=21 running=True browser=Chrome/157.0.8103.39",
+          "ms": 1071
+        },
+        {
+          "name": "GET /api/log?lines=3 : 日志尾部正常返回且夹取上限生效",
+          "ok": true,
+          "detail": "status=200 行数=3",
+          "ms": 25
+        },
+        {
+          "name": "GET /favicon.ico : 204 空响应 (不刷错误日志)",
+          "ok": true,
+          "detail": "status=204 len=0",
+          "ms": 23
+        },
+        {
+          "name": "GET 未知路径 : 404 {error:not found}",
+          "ok": true,
+          "detail": "status=404 body=b'{\"error\": \"not found\"}'",
+          "ms": 3
+        },
+        {
+          "name": "GET /api/thumb 不存在的 id : 404 + no-store (前端会自动重试)",
+          "ok": true,
+          "detail": "status=404 cache=no-store, max-age=0",
+          "ms": 14
+        },
+        {
+          "name": "GET /api/events : SSE 首帧即完整 snapshot (实时进度不断线)",
+          "ok": true,
+          "detail": "首帧键数=21 raw=b'HTTP/1.1 200 OK\\r\\nServer: BaseHTTP/0.6 Python/3.12.0\\r\\nDate: F'",
+          "ms": 17
+        },
+        {
+          "name": "POST /api/settings : quality/auto_gap/by_author 写入生效并**逐字节还原用户设置**",
+          "ok": true,
+          "detail": "写入=True/True 还原=True/True 原值 q=max gap=3.0 by_author=False",
+          "ms": 99
+        },
+        {
+          "name": "POST /api/retry 不存在的失败项 : 返回 ok=false, 不误触发任务",
+          "ok": true,
+          "detail": "status=200 body=b'{\"ok\": false}'",
+          "ms": 1
+        },
+        {
+          "name": "POST /api/fail/dismiss 不存在的失败项 : 返回 ok=false (叉掉按钮不空转)",
+          "ok": true,
+          "detail": "status=200 body=b'{\"ok\": false}'",
+          "ms": 2
+        },
+        {
+          "name": "POST /api/delete 合法但不存在 id : 幂等返回 ok=true, 真实文件不受影响",
+          "ok": true,
+          "detail": "status=200 body=b'{\"ok\": true}' (恒真, 不会删真实文件)",
+          "ms": 954
+        },
+        {
+          "name": "POST 未知路径 : 404",
+          "ok": true,
+          "detail": "status=404",
+          "ms": 0
+        },
+        {
+          "name": "POST 超大 Content-Length : 读 body 之前就回 400 (防内存打满)",
+          "ok": true,
+          "detail": "resp=b'HTTP/1.1 400 Bad Request\\r\\nServer: BaseHTTP/0.6 Python/3.12.0\\r\\nDate: Fri, 13 Nov 2026 13:05:12 GMT\\r\\nContent-Type: applica'",
+          "ms": 1
+        },
+        {
+          "name": "POST 非法设置: 非法画质被忽略; 危险字段(自动下载开关)始终未被打开",
+          "ok": true,
+          "detail": "非法画质被忽略 q=max auto_rec=False auto_adv=False",
+          "ms": 56
+        }
+      ]
+    },
+    {
+      "name": "G · 真浏览器钩子注入 (双站点) + 运行实例的钩子存活",
+      "checks": [
+        {
+          "name": "[第2轮·第1次] tests/hook_smoke.py 真浏览器注入 HOOK_JS: 9/9 全过",
+          "ok": true,
+          "detail": "returncode=0 tail=['  TOTAL: 9/9 passed']",
+          "ms": 4998
+        },
+        {
+          "name": "[第2轮·第2次] 再跑一遍钩子冒烟(重复验证, 无偶发失败)",
+          "ok": true,
+          "detail": "returncode=0 tail=['  TOTAL: 9/9 passed']",
+          "ms": 5095
+        },
+        {
+          "name": "live CDP 只读: 用户浏览器里 HOOK_VER=10 / __DY_HOOKED_V2__ / fetch 已替换",
+          "ok": true,
+          "detail": "ver=10 hooked=True fetch='function (...args) {\\n    const req = args[0];\\n    const url ' url=chrome-error://chromewebdata/",
+          "ms": 599
+        },
+        {
+          "name": "护栏: 上面的 CDP 只读检查之后, 用户浏览器 9222 仍然存活(没被关掉)",
+          "ok": true,
+          "detail": "守护栏: 9222 /json/version status=200",
+          "ms": 27
+        }
+      ]
+    },
+    {
+      "name": "H · 运行时与守护进程 / 全量测试 / 版本一致性 / 工作区干净",
+      "checks": [
+        {
+          "name": "端口: 面板 8899 与调试 9222 都在监听",
+          "ok": true,
+          "detail": "8899=True 9222=True",
+          "ms": 3
+        },
+        {
+          "name": "进程树: daemon → 主程序 → Chrome(9222) 全在运行",
+          "ok": true,
+          "detail": "python=2 main=True daemon=True chrome9222=True names=['pythonw.exe', 'pythonw.exe', 'chrome.exe', 'chrome.exe', 'chrome.exe', 'chrome.exe', 'chrome.exe', 'chrome.exe', 'powershell.exe']",
+          "ms": 1165
+        },
+        {
+          "name": "运行日志: v1.7 新文案「抖音 / 快手」+「✔ 监听已启动」",
+          "ok": true,
+          "detail": "日志尾部含新文案=True 含监听已启动=True",
+          "ms": 15
+        },
+        {
+          "name": "daemon.log: 守护启动 + 自动拉起下载进程记录存在",
+          "ok": true,
+          "detail": "daemon.log 尾部含守护启动与拉起记录",
+          "ms": 2
+        },
+        {
+          "name": "版本/钩子一致性: 1.7.0 + HOOK_VER=10 两侧同步, fetch 钩子不带 writable",
+          "ok": true,
+          "detail": "version=1.7.0 py_ver=10 js_ver=10 fetch 描述符无 writable=True",
+          "ms": 0
+        },
+        {
+          "name": "[第2轮] 全量 pytest tests/ : ≥228 passed, 0 failed",
+          "ok": true,
+          "detail": "pytest: 228 passed, failed=0, rc=0",
+          "ms": 8832
+        },
+        {
+          "name": "HOOK_JS 交给 node --check 真编译(不是只看 Python 语法)",
+          "ok": true,
+          "detail": "node --check rc=0 err=",
+          "ms": 165
+        },
+        {
+          "name": "所有 Python 源文件 ast.parse 通过",
+          "ok": true,
+          "detail": "ast.parse 17 个 py 文件, 失败=[]",
+          "ms": 99
+        },
+        {
+          "name": "git: 已跟踪文件全部干净(验收只新增 acceptance/ 证据, 不改产品代码)",
+          "ok": true,
+          "detail": "已跟踪文件改动=[] HEAD=2fa5afd test: 补快手完整下载链路回归 + 同步 README 测试数",
+          "ms": 222
+        }
+      ]
+    }
+  ],
+  "total": 77,
+  "passed": 77,
+  "failed": 0
+}

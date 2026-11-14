@@ -14,6 +14,10 @@ downloads/
 douyin_dl.log
 *.log
 
+# 验收报告是每次重新生成的产物(脚本与 round_*.json 证据照常入库)
+acceptance/验收报告.html
+acceptance/验收报告.png
+
 # 临时文件
 *.part
 .tmp*
