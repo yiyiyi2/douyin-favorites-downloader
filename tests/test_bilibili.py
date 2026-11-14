@@ -408,6 +408,7 @@ def test_fill_bili_fills_dash_and_metadata(monkeypatch):
     M = _load_main()
     dl = M.Downloader.__new__(M.Downloader)
     dl.session = object()
+    dl.bili_session = object()   # v2.1.1: B站单独 session
     dl.state = _FakeState()
     dl.bus = _FakeBus()
     dl.count_ok = dl.count_skip = dl.count_fail = 0
@@ -430,6 +431,7 @@ def test_fill_bili_falls_back_to_durl_for_old_videos(monkeypatch):
     M = _load_main()
     dl = M.Downloader.__new__(M.Downloader)
     dl.session = object()
+    dl.bili_session = object()   # v2.1.1: B站单独 session
     dl.log = lambda *a: None
     monkeypatch.setattr(bili, "fetch_view", lambda s, b, log=None: bili_view())
     monkeypatch.setattr(bili, "fetch_dash", lambda s, b, c, log=None: {
@@ -445,6 +447,7 @@ def test_fill_bili_survives_view_failure(monkeypatch):
     M = _load_main()
     dl = M.Downloader.__new__(M.Downloader)
     dl.session = object()
+    dl.bili_session = object()   # v2.1.1: B站单独 session
     dl.log = lambda *a: None
     monkeypatch.setattr(bili, "fetch_view", lambda s, b, log=None: {})
     info = core.parse_any({"aweme_id": BV, "_platform": PLATFORM_BILIBILI, "_view": {}})
@@ -594,6 +597,7 @@ def test_downloader_process_uses_bili_branch(tmp_path, monkeypatch):
     M = _load_main()
     dl = M.Downloader.__new__(M.Downloader)
     dl.session = object()
+    dl.bili_session = object()   # v2.1.1: B站单独 session
     dl.state = _FakeState(has=False)
     bus = _FakeBus()
     dl.bus = bus
@@ -723,3 +727,69 @@ def test_resolve_pending_still_routes_kuaishou_to_headless():
 
     assert puts, "快手 id 应该进无头队列"
     assert puts[0][0] == "3xun955567ak6qe"
+
+
+# ---------------------------------------------------------------- v2.1.1
+# B站画质靠登录态: 匿名 480P / 登录 1080P / 大会员 4K。
+# 历史上 _sync_cookies 只同步抖音 Cookie, B站 playurl 一直走匿名态,
+# 大会员也只能下到 480P(用户报"太糊")。同时两条 Cookie 通道必须隔离,
+# 混在一起会把抖音 sessionid 发给 api.bilibili.com。
+
+def test_sync_cookies_routes_bilibili_to_separate_channel():
+    """抖音 Cookie 走 on_cookie, B站 Cookie 走 on_cookie_bili, 互不混淆。"""
+    w = BrowserWatcher(profile_dir=Path(tempfile.mkdtemp()), log=lambda m: None)
+    got = {"douyin": None, "bili": None}
+    w.on_cookie = lambda c: got.__setitem__("douyin", c)
+    w.on_cookie_bili = lambda c: got.__setitem__("bili", c)
+
+    class _Ctx:
+        def cookies(self):
+            return [
+                {"name": "sessionid", "value": "DY123", "domain": ".douyin.com"},
+                {"name": "ttwid", "value": "t1", "domain": ".douyin.com"},
+                {"name": "SESSDATA", "value": "BILI456", "domain": ".bilibili.com"},
+                {"name": "bili_jct", "value": "j1", "domain": ".bilibili.com"},
+                {"name": "userId", "value": "KS789", "domain": ".kuaishou.com"},
+            ]
+
+    w._sync_cookies(_Ctx())
+
+    assert got["douyin"] == "sessionid=DY123; ttwid=t1"
+    assert got["bili"] == "SESSDATA=BILI456; bili_jct=j1"
+    # 快手 cookie 两边都不能进(快手 CDN 直链是公开的, 不需要)
+    assert "userId" not in (got["douyin"] or "")
+    assert "userId" not in (got["bili"] or "")
+    # 互相隔离: 抖音通道里不能有 B站 cookie, 反之亦然
+    assert "SESSDATA" not in (got["douyin"] or "")
+    assert "sessionid" not in (got["bili"] or "")
+
+
+def test_fill_bili_uses_bili_session_not_douyin_session(monkeypatch):
+    """_fill_bili 必须用 bili_session(带 B站 SESSDATA), 不能用抖音 session。"""
+    M = _load_main()
+    dl = M.Downloader.__new__(M.Downloader)
+    dy_session = object()
+    bili_session = object()
+    dl.session = dy_session
+    dl.bili_session = bili_session
+    dl.log = lambda *a: None
+
+    seen = {}
+
+    def _fake_view(session, b, log=None):
+        seen["view"] = session
+        return bili_view()
+
+    def _fake_dash(session, b, c, log=None):
+        seen["dash"] = session
+        return bili_dash(4)
+
+    monkeypatch.setattr(bili, "fetch_view", _fake_view)
+    monkeypatch.setattr(bili, "fetch_dash", _fake_dash)
+
+    info = core.parse_any({"aweme_id": BV, "_platform": PLATFORM_BILIBILI, "_view": {}})
+    dl._fill_bili(info)
+
+    assert seen["view"] is bili_session
+    assert seen["dash"] is bili_session
+    assert seen["view"] is not dy_session

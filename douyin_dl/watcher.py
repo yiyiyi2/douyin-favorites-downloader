@@ -1114,6 +1114,7 @@ class BrowserWatcher:
         headless: bool = False,
         on_status: Callable[[dict], None] | None = None,
         on_pending: Callable[[str], None] | None = None,
+        on_cookie_bili: Callable[[str], None] | None = None,
     ):
         self.profile_dir = Path(profile_dir)
         self.port = port
@@ -1127,6 +1128,10 @@ class BrowserWatcher:
         # 那一刻就先占个位, 详情回来后由 add_waiting/begin 自动接管。
         self.on_pending = on_pending or (lambda aid: None)
         self.on_cookie = on_cookie or (lambda c: None)
+        # v2.1.1: B站 Cookie 单独一条通道。B站 playurl 按登录态给画质,
+        # 匿名 480P / 登录 1080P / 大会员 4K。但 B站 Cookie 绝不能混进
+        # 抖音那个全局 Cookie 头(会互相泄露), 所以单独走。
+        self.on_cookie_bili = on_cookie_bili or (lambda c: None)
         self.log = log
         self.headless = headless
         self.proc: subprocess.Popen | None = None
@@ -2619,11 +2624,18 @@ class BrowserWatcher:
         把浏览器里的登录 Cookie 同步给下载器。
         抖音的视频地址带 tk=webid, 是绑定登录态的; 不带 Cookie 直接 GET 会 403。
 
-        v1.7: 这里**只同步抖音 cookie**。快手 CDN 直链是公开的
+        v1.7: 抖音这里**只同步抖音 cookie**。快手 CDN 直链是公开的
         (实测裸请求就能 200 下完 23MB), 不需要任何 Cookie; 把快手那堆
         kwpsecproductname/kwssectoken 混进抖音的 Cookie 头反而可能让
         抖音 CDN 挑刺, 所以刻意不合并。快手登录态只用于「点收藏」这个
         页面动作, 那是用户浏览器自己的事。
+
+        v2.1.1: B站单独走一条 `on_cookie_bili` 通道。B站的 playurl 接口
+        按登录态给画质 —— 匿名只能拿 480P, 登录 1080P, 大会员才有
+        1080P+/4K/8K。所以必须把浏览器里的 B站 Cookie 送去。但**绝不能**
+        混进抖音那个全局 Cookie 头: 那样抖音的 sessionid 会被发给
+        api.bilibili.com, 而且 B站 Cookie 里的 SESSDATA 也会被发给抖音 CDN。
+        两条通道各自维护, 互不污染。
         """
         try:
             parts = []
@@ -2633,6 +2645,18 @@ class BrowserWatcher:
                     parts.append(f"{c['name']}={c['value']}")
             if parts:
                 self.on_cookie("; ".join(parts))
+        except Exception:
+            pass
+
+        # B站 Cookie 单独一条(见上面 docstring: 不能和抖音混)
+        try:
+            bparts = []
+            for c in ctx.cookies():
+                dom = c.get("domain") or ""
+                if "bilibili" in dom or "bilibili" in (c.get("url") or ""):
+                    bparts.append(f"{c['name']}={c['value']}")
+            if bparts and callable(getattr(self, "on_cookie_bili", None)):
+                self.on_cookie_bili("; ".join(bparts))
         except Exception:
             pass
 

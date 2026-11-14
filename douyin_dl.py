@@ -390,6 +390,17 @@ class Downloader(threading.Thread):
         self.count_skip = 0
         self.count_fail = 0
         self._rec_prefetch: dict[str, int] = {}   # 推荐页详情预取的重试计数
+        # v2.1.1: B站单独一个 session。B站 playurl 按登录态给画质
+        # (匿名 480P / 登录 1080P / 大会员 4K), 所以必须带用户浏览器里的
+        # B站 Cookie。但**不能**塞进 self.session —— 那是抖音的会话,
+        # 里面已经有抖音 Cookie; 混在一起会把抖音 sessionid 发给
+        # api.bilibili.com, B站的 SESSDATA 也会被发给抖音 CDN。
+        # 两条通道各用各的 session, Cookie 互不可见。
+        self.bili_session = build_session()
+        self.bili_session.headers.update({
+            "Referer": bili.REFERER_BILI,
+            "Origin": "https://www.bilibili.com",
+        })
 
     # -- 面板事件小工具 ------------------------------------------------
     def _ev(self, name, *a):
@@ -468,7 +479,10 @@ class Downloader(threading.Thread):
         """
         bvid = info.aweme_id
         try:
-            view = bili.fetch_view(self.session, bvid, log=self.log)
+            # v2.1.1: 用 bili_session(自带用户浏览器里的 B站登录 Cookie)。
+            # 用抖音的 self.session 时 playurl 走匿名态, 最高只给 480P;
+            # 带上 SESSDATA(大会员) 才会返回 1080P+/4K/8K 那些高画质轨。
+            view = bili.fetch_view(self.bili_session, bvid, log=self.log)
             if not view:
                 self.log("  ! B站 view 拿不到(可能已删除/私密/需要登录)")
                 return info
@@ -491,7 +505,7 @@ class Downloader(threading.Thread):
             if not cid:
                 self.log("  ! B站 view 里没有 cid, 跳过")
                 return info
-            dash = bili.fetch_dash(self.session, bvid, cid, log=self.log)
+            dash = bili.fetch_dash(self.bili_session, bvid, cid, log=self.log)
             if not dash:
                 self.log("  ! B站 playurl 拿不到播放地址")
                 return info
@@ -653,7 +667,7 @@ class Downloader(threading.Thread):
             # 抖音/快手是音视频合一的 mp4, 走原来的单流下载。
             if getattr(cand, "needs_merge", False):
                 got = bili.download_dash(
-                    self.session, cand, dest, log=self.log,
+                    self.bili_session, cand, dest, log=self.log,
                     on_progress=lambda d, t: self._ev("progress", aid, d, t))
             else:
                 got = download(self.session, cand.url, dest, log=self.log,
@@ -1044,6 +1058,11 @@ def main():
         on_status=lambda kw: bus.set_status(**kw),
         # 识别到收藏动作就立刻让面板出现"解析中", 不等详情抓回来
         on_pending=lambda aid: bus.add_waiting(aid, source="解析中"),
+        # v2.1.1: B站 Cookie 单独一条通道 -> 只写进 dl.bili_session。
+        # B站 playurl 按登录态给画质(匿名 480P / 登录 1080P / 大会员 4K),
+        # 必须带上用户的 SESSDATA。但绝不能写进上面那个抖音的 session,
+        # 否则两家 Cookie 会互相泄露给对方的服务器。
+        on_cookie_bili=lambda c: dl.bili_session.headers.update({"Cookie": c}),
     )
     def _on_fail(aid, why):
         # v1.6.3: 失败时还得把队列里那条「解析中」占位摘掉。v1.6.2 只记了失败

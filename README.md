@@ -1,8 +1,8 @@
-# 抖音 / 快手 / B站收藏自动下载 · v2.1
+# 抖音 / 快手 / B站收藏自动下载 · v2.1.1
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-2.1.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.1.1-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -167,6 +167,26 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.1.1
+
+**主题：修「B站明明是大会员，下下来的却很糊」—— B站登录 Cookie 没有同步。**
+
+- **根因**：`_sync_cookies` 只把**抖音**的 Cookie 同步给下载器，B站 Cookie
+  从来没进过请求头。而 B站的 `playurl` 接口是**按登录态决定画质档位**的：
+  匿名最高只有 480P，登录 1080P，大会员才有 1080P+ / 4K / 8K。所以哪怕你是
+  大会员，程序也一直按匿名态请求，只能拿到 480P —— 这就是"糊"的原因。
+- **修复**：新增一条独立的 `on_cookie_bili` 通道 + 一个**独立的 `bili_session`**，
+  B站 Cookie 只写进它。**刻意不合并**到抖音那个 session 里 —— 两家 Cookie 混在
+  一个 `Cookie` 头里，会把抖音的 `sessionid` 发给 `api.bilibili.com`、把 B站的
+  `SESSDATA` 发给抖音 CDN，属于凭据泄露。`_fill_bili`（拿 cid / 码率表）和
+  `download_dash`（下音视频轨）都改用 `bili_session`。
+- **实测对比**（同一个投稿 `av114962919855294`）：修复前匿名态只有 **6 条轨、
+  最高 426x854**；修复后带登录 Cookie 是 **18 条轨、最高 4K 1920x3840
+  bw=7168353**，还有 1080P+ / 1080P / 720P / 480P / 360P 各 3 种编码。
+  最高档直链与音轨直链都实测返回 `HTTP 206`、可正常下载。
+- **回归测试**：新增 2 例（Cookie 按站点分流且互不污染、`_fill_bili` 必须用
+  `bili_session` 而不是抖音 session），全量 **279 例通过**。
 
 ## v2.1
 
