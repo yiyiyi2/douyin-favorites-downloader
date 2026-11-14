@@ -1238,13 +1238,16 @@ def run_round(n):
         p = subprocess.run(["git", "status", "--short"], cwd=str(ROOT),
                            capture_output=True, timeout=30)
         out = (p.stdout or b"").decode("utf-8", "replace").strip()
-        tracked = [l for l in out.splitlines() if l and not l.startswith("?? acceptance/")]
+        # 排除验收自己的产物: round_N.json 跑完就会被重写, 那是证据不是产品代码。
+        tracked = [l for l in out.splitlines()
+                   if l and not l.startswith("?? acceptance/")
+                   and " acceptance/" not in l]
         R.evidence["git_status"] = out[:500]
         R.evidence["git_head"] = subprocess.run(
             ["git", "log", "--oneline", "-1"], cwd=str(ROOT), capture_output=True
         ).stdout.decode("utf-8", "replace").strip()
-        return (not tracked, f"已跟踪文件改动={tracked} HEAD={R.evidence['git_head']}")
-    R.check("git: 已跟踪文件全部干净(验收只新增 acceptance/ 证据, 不改产品代码)", h9)
+        return (not tracked, f"产品代码改动={tracked} HEAD={R.evidence['git_head']}")
+    R.check("git: 产品代码全部干净(验收只重写自己的 acceptance/ 证据)", h9)
 
     # 收尾
     try:
