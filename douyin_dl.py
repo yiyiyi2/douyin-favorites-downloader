@@ -969,6 +969,10 @@ def main():
     ap.add_argument("--ui-port", type=int, default=8899, help="本地面板端口 (默认 8899)")
     ap.add_argument("--no-ui", action="store_true", help="不启动本地面板, 也不打开浏览器")
     ap.add_argument("--no-open", action="store_true", help="启动面板但不要自动打开浏览器")
+    ap.add_argument("--offline", "--player-only", dest="offline",
+                    action="store_true",
+                    help="纯离线模式: 只起面板+离线播放器, 不碰浏览器/不下载。"
+                         "没网也能刷已经下好的视频")
     args = ap.parse_args()
 
     global OUT_DIR, _CDP_PORT
@@ -1036,6 +1040,42 @@ def main():
             return 2
         log(f"  登录状态: {'✔ 已登录' if ok else '✘ 未登录'}")
         return 0 if ok else 1
+
+    # v2.5: 纯离线模式 —— 只读本地已下载的视频, 完全不联网。
+    # 旧版播放器寄生在下载主程序里, 而主程序启动链路必然 start_chrome()
+    # 连抖音: 没网 / 没开 Chrome 时就起不来, 于是离线刷视频根本用不了。
+    # 这里在**抢实例锁之前**返回, 这样用户可以在下载进程照常跑着的同时
+    # 再开一个离线播放器(只读, 不写 .state.json, 不冲突)。
+    if args.offline:
+        bus = EventBus(WORKSPACE, OUT_DIR, STATE_FILE, LOG_FILE)
+        bus.set_status(running=False, browser="", note="离线模式(不联网)")
+        # 8899 上已经有别的面板(比如下载主程序在跑)时, start_ui 只会挂一个
+        # 看门狗等接管, 不会再开一份 —— 这时直接把已有的那个给用户用就行。
+        _already = False
+        try:
+            import urllib.request as _ur
+            with _ur.urlopen(f"http://127.0.0.1:{args.ui_port}/api/state",
+                             timeout=2) as _r:
+                _already = _r.status == 200
+        except Exception:
+            pass
+        ui_url = start_ui(bus, WEB_FILE, port=args.ui_port,
+                          open_browser=not args.no_open, log=log)
+        log(f"  面板: {ui_url}")
+        if _already:
+            log("  8899 上已经有一个面板在跑, 直接用那个即可")
+        log(f"  离线播放器: {ui_url.rstrip('/')}/player")
+        log(f"  视频目录: {OUT_DIR}")
+        log("")
+        log("  离线模式已就绪 —— 完全不联网, 只播本机已下载的视频。")
+        log("  关掉这个窗口/Ctrl+C 即可退出。")
+        try:
+            while True:
+                time.sleep(3600)
+        except KeyboardInterrupt:
+            log("")
+            log("  已退出离线模式。")
+        return 0
 
     # 锁必须放在开面板/弹浏览器之前: 不然双击两次会把面板也起两份
     # (旧顺序里第二次启动已经把面板/浏览器弹出来了才在这里退出)。

@@ -861,6 +861,12 @@ function closeCmt() {
   $('#cmt').classList.remove('open');
   cInput.value = '';
   cSend.disabled = true;
+  // v2.5: 必须把焦点从输入框挪走。openCmt 里会自动 focus 输入框, 关抽屉时
+  // 焦点还留在 TEXTAREA 上, 而键盘处理开头对 TEXTAREA/INPUT 直接 return ——
+  // 结果就是"打开过一次评论后, ↑↓/空格/M/G/D/F 全部失灵", 得点一下画面才好。
+  if (document.activeElement && document.activeElement.blur) {
+    document.activeElement.blur();
+  }
 }
 function renderCmt() {
   const it = ITEMS[cur];
@@ -1068,8 +1074,12 @@ $('#btnAuto').addEventListener('click', () => {
 
 /* ---------------- 键盘 ---------------- */
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   const k = e.key.toLowerCase();
+  // v2.5: 先处理 Esc —— 关闭评论抽屉必须能打断输入框里的焦点。
+  // 旧版这行 return 放在最前面, 焦点在评论输入框时按 Esc 直接被吞,
+  // 抽屉关不掉, 之后 ↑↓/空格/M/G/D/F 也全部失灵(得先点一下画面)。
+  if (k === 'escape') { closeCmt(); return; }
+  if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
   if (k === 'arrowdown' || k === 'j') { e.preventDefault(); go(1); }
   else if (k === 'arrowup' || k === 'k') { e.preventDefault(); go(-1); }
   else if (k === ' ') { e.preventDefault(); togglePlay(cur); }
@@ -1080,7 +1090,6 @@ document.addEventListener('keydown', (e) => {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen().catch(() => {});
   }
-  else if (k === 'escape') { closeCmt(); }
 });
 
 /* ---------------- 启动 ---------------- */

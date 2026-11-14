@@ -1,8 +1,8 @@
-# 抖音 / 快手 / B站收藏自动下载 · v2.4
+# 抖音 / 快手 / B站收藏自动下载 · v2.5
 
 **你只管正常刷视频、点「收藏」，视频会自动以最高画质、无水印保存到本地，全程不弹窗、不切页面。**
 
-![版本](https://img.shields.io/badge/version-2.4.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
+![版本](https://img.shields.io/badge/version-2.5.0-fe2c55) ![Python](https://img.shields.io/badge/python-3.10%2B-25f4ee) ![平台](https://img.shields.io/badge/platform-Windows-blue)
 
 ---
 
@@ -167,6 +167,32 @@ douyin_dl.log           运行日志
 - 仅供个人备份自己收藏的内容使用
 
 # 更新记录
+
+## v2.5
+
+**主题：离线也能刷 —— 双击 `离线刷视频.bat`，不联网、不碰浏览器。**
+
+- **问题**：以前离线播放器寄生在下载主程序里，而主程序启动链路必然
+  `start_chrome()` 连抖音。没网 / 没开 Chrome 时就起不来，"刷已下好的视频"
+  这个功能等于用不了。
+- **做法**：`douyin_dl.py` 新增 `--offline`（别名 `--player-only`）—— 只做
+  `EventBus` + `start_ui`，**不创建 Downloader、不创建 BrowserWatcher、
+  不调 start_chrome、不连 CDP**。而且它跑在**抢实例锁之前**，所以下载进程
+  照常跑着的时候也能同时开离线播放器（纯只读，不写 `.state.json`）。
+- **入口**：新增双击 `离线刷视频.bat`，自动开 `http://127.0.0.1:8899/player`。
+  8899 已被占用时复用已有面板，不重复开第二份。
+- **顺带修的真 bug（打开过评论后快捷键全失灵）**：`openCmt` 自动 focus 输入框，
+  而 `keydown` 处理开头对 `TEXTAREA/INPUT` 直接 return —— 于是关闭评论后
+  `↑↓/空格/M/G/D/F` 全部失效，连 `Esc` 都关不掉抽屉。改成 Esc 提到最前面
+  先处理、`closeCmt()` 里 `blur()` 掉焦点。
+- **实测**：用 socket 层把外部网络全部拦掉（只放行 127.0.0.1）跑离线模式 →
+  **被拦的联网尝试 `[]`（零外部请求）**；同一环境真 Chromium 打开播放器：
+  174 个视频全部在列、第一条 `readyState=4 / error=0`、时间从 1.5s 走到 3.5s、
+  ↓ 键切到 `2 / 174`、评论抽屉能开关、关后焦点回到 BODY 且 `m` 键仍生效、
+  `g` 键折叠网格后 `stage` 从 1154 变 1440（点赞栏仍贴边 12px）、**0 JS 报错**。
+- **回归测试**：新增 6 例（`--offline` 参数存在、离线分支跑在抢锁之前、
+  离线代码块里不出现任何浏览器接口、`离线刷视频.bat` 存在、
+  `closeCmt` 会 blur、Esc 在输入框判断之前处理），全量 **351 例通过**。
 
 ## v2.4
 

@@ -400,3 +400,79 @@ def test_player_e2e_real_browser(tmp_path):
     # 开着自动连播时也要稳
     a1, a2 = payload["auto_pos"]
     assert a2 == p0, f"开着自动连播时 ↑ 被 ended 拽走: {a1} -> {a2}"
+
+
+# ---------------- v2.5: 离线模式 ----------------
+
+def test_offline_flag_exists_in_main():
+    """v2.5 回归: douyin_dl.py 必须有 --offline/--player-only。
+
+    用户诉求原话: 「这儿ui界面需要抖音之类的打开才能启动, 所以我没办法在没网
+    的情况下去刷下过的视频」。所以必须有一个完全不碰浏览器的入口。
+    """
+    src = (_ROOT / "douyin_dl.py").read_text(encoding="utf-8")
+    assert '"--offline"' in src and '"--player-only"' in src
+    assert 'dest="offline"' in src
+
+
+def test_offline_mode_runs_before_instance_lock():
+    """离线模式必须在抢实例锁**之前**返回。
+
+    否则用户在下载进程照常跑着的时候再开离线播放器, 会被
+    `_acquire_instance_lock` 挡掉直接退 3 —— 而离线模式是只读的, 完全
+    可以和下载进程共存。
+    """
+    src = (_ROOT / "douyin_dl.py").read_text(encoding="utf-8")
+    i_off = src.index("if args.offline:")
+    i_lock = src.index("_LOCK = _acquire_instance_lock()")
+    assert i_off < i_lock, "离线分支跑在抢锁之后了, 会和下载进程互斥"
+
+
+def test_offline_mode_never_touches_browser():
+    """离线分支里不能出现任何浏览器/下载相关的东西。"""
+    src = (_ROOT / "douyin_dl.py").read_text(encoding="utf-8")
+    i_off = src.index("if args.offline:")
+    # 从离线分支开头截到抢锁注释为止, 就是离线模式的完整代码块
+    i_end = src.index("# 锁必须放在开面板/弹浏览器之前")
+    block = src[i_off:i_end]
+    for bad in ("start_chrome", "BrowserWatcher", "Downloader(",
+                "sync_playwright", "connect_over_cdp", "_probe_port"):
+        assert bad not in block, f"离线模式里不该出现 {bad}"
+    # 但它必须真的把面板起来
+    assert "start_ui(" in block and "EventBus(" in block
+
+
+def test_offline_bat_exists():
+    p = _ROOT / "离线刷视频.bat"
+    assert p.exists(), "缺少 离线刷视频.bat 双击入口"
+    t = p.read_text(encoding="utf-8", errors="replace")
+    assert "--offline" in t
+    assert "8899" in t and "player" in t
+
+
+def test_close_cmt_blurs_focus():
+    """v2.5 回归: 关评论抽屉必须 blur 输入框。
+
+    openCmt 会自动 focus textarea; 关抽屉时焦点如果还留在 TEXTAREA 上,
+    keydown 处理开头那句 `TEXTAREA/INPUT 直接 return` 会把所有快捷键吞掉,
+    表现为"打开过一次评论后 ↑↓/空格/M/G/D/F 全失灵"。
+    """
+    body = re.sub(r"/\*.*?\*/", "", _player_src(), flags=re.S)
+    m = re.search(r"function closeCmt\(\)\s*\{(.*?)\n\}", body, re.S)
+    assert m, "没找到 closeCmt"
+    assert "blur()" in m.group(1), "closeCmt 没有把焦点从输入框挪走"
+
+
+def test_escape_handled_before_input_guard():
+    """v2.5 回归: Esc 必须在「输入框里就 return」那句之前处理。
+
+    否则焦点在评论输入框时按 Esc 直接被吞, 抽屉关不掉、快捷键也回不来。
+    """
+    body = re.sub(r"/\*.*?\*/", "", _player_src(), flags=re.S)
+    m = re.search(r"document\.addEventListener\('keydown',\s*\(e\)\s*=>\s*\{(.*?)\n\}\);",
+                  body, re.S)
+    assert m, "没找到 keydown 处理器"
+    handler = m.group(1)
+    i_esc = handler.index("k === 'escape'")
+    i_guard = handler.index("e.target.tagName === 'TEXTAREA'")
+    assert i_esc < i_guard, "Esc 被输入框判断挡在后面了, 关不掉评论抽屉"
