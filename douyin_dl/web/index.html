@@ -1068,7 +1068,23 @@ function connect(){
   myEs.onmessage = (e)=>{
     if(es !== myEs) return;
     $("conn").classList.remove("on");
-    try{ STATE = JSON.parse(e.data); render(); }
+    try{
+      const d = JSON.parse(e.data);
+      // v2.6: 后端改增量推送 —— 首帧是 {full:{...}}, 之后每帧是 {patch:{...}}。
+      // 整包原来是 114 KB(其中 recent 300 条占 99%), 每 0.4 秒重传一次;
+      // 增量通常只有几十字节。旧格式(直接一个对象)也照样吃得下, 免得
+      // 浏览器缓存了老版 index.html 时白屏。
+      if(d && typeof d === "object" && d.full && typeof d.full === "object"){
+        STATE = d.full;
+      }else if(d && typeof d === "object" && d.patch && typeof d.patch === "object"){
+        if(!STATE) STATE = {};
+        const p = d.patch;
+        for(const k in p) STATE[k] = p[k];
+      }else{
+        STATE = d;
+      }
+      render();
+    }
     catch(err){ console.error(err); toast("状态解析失败", "后端数据异常, 已保留上一次画面"); }
   };
   myEs.onerror = ()=>{

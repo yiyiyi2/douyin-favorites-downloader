@@ -197,7 +197,7 @@ def test_player_has_like_and_fav_filters():
                  "flag === 'follow' && !FOLLOW[it.author"):
         assert cond in body, f"buildGrid 缺过滤条件: {cond}"
     # 两个维度都不为 all 时才都生效(AND 语义)
-    assert "plat !== 'all' && platLabel(it) !== plat" in body
+    assert "plat !== 'all' && platOf(it) !== plat" in body
 
 
 def test_player_flags_rebuild_on_mark_change():
@@ -243,6 +243,141 @@ def test_player_ended_only_advances_current():
     assert m, "找不到 ended 处理"
     body = m.group(0)
     assert "i !== cur" in body, "ended 必须过滤掉非当前视频"
+
+
+# ---------------------- 5. 审查报告修复项的回归(静态约束)
+def _js_body() -> str:
+    """抽 player.html 里的 <script> 并剥掉注释, 供静态断言。"""
+    t = _player_src()
+    m = re.search(r"<script>(.*)</script>", t, re.S)
+    assert m, "找不到 <script>"
+    return re.sub(r"/\*.*?\*/", "", m.group(1), flags=re.S)
+
+
+def test_player_go_unloads_far_videos():
+    """致命1: 键盘 go() 切换时必须 unloadFar(cur), 否则按住 ↓ 刷完全部,
+    每个 video 的 src 都常驻内存(175 个 4K 视频会爆)。"""
+    body = _js_body()
+    m = re.search(r"function go\(delta, autoplay\)\s*\{(.*?)\n\}", body, re.S)
+    assert m, "找不到 go()"
+    assert "unloadFar(cur)" in m.group(1), "go() 里必须 unloadFar(cur) 卸载远端 video"
+
+
+def test_player_go_and_jump_close_cmt():
+    """致命2: 切视频(go/jump)必须先关评论抽屉, 否则评论会写错视频。"""
+    body = _js_body()
+    for fn in ("go", "jump"):
+        m = re.search(r"function " + fn + r"\([^)]*\)\s*\{(.*?)\n\}", body, re.S)
+        assert m, f"找不到 {fn}()"
+        assert "closeCmt()" in m.group(1), f"{fn}() 里必须关评论抽屉"
+
+
+def test_player_act_takes_explicit_index():
+    """严重3: act(name, idx) 必须落在被点的那个格子上, 不能只认全局 cur。"""
+    body = _js_body()
+    assert "function act(name, idx)" in body, "act 必须有 idx 参数"
+    m = re.search(r"function act\(name, idx\)\s*\{(.*?)\n\}", body, re.S)
+    assert "const i = (idx == null ? cur : idx);" in m.group(1), (
+        "act 里要解析 idx 参数")
+
+
+def test_player_open_cmt_uses_tracked_index():
+    """致命2: 评论抽屉要绑定到 cmtIdx(开抽屉时的视频), 而不是调用时的 cur。"""
+    body = _js_body()
+    assert "let cmtIdx" in body, "要有 cmtIdx 变量记录评论绑定的视频"
+    assert "cmtIdx = idx" in body, "openCmt 要记录 cmtIdx"
+
+
+def test_player_cmt_focus_timer_cleared():
+    """严重4: openCmt 的 focus 定时器必须能被 closeCmt 取消, 否则开评论后
+    260ms 内按 Esc, 焦点又被塞回隐藏输入框, 键盘全部失灵。"""
+    body = _js_body()
+    assert "let cmtFocusTimer" in body, "要有 cmtFocusTimer 变量"
+    assert "clearTimeout(cmtFocusTimer)" in body, "closeCmt/openCmt 要 clearTimeout"
+    assert "cmtFocusTimer = setTimeout" in body
+
+
+def test_player_linkify_splits_before_escape():
+    """严重5: linkify 必须先切话题段再逐段 esc, 否则撇号转成 &#39; 会被
+    正则从中间切开(#39 当话题)。"""
+    body = _js_body()
+    m = re.search(r"function linkify\(t\)\s*\{(.*?)\n\}", body, re.S)
+    assert m, "找不到 linkify()"
+    assert "split(/(#[^\\s#]+)/g)" in m.group(1), "linkify 要先 split 话题"
+    assert "startsWith('#')" in m.group(1), "按段判断是否话题"
+
+
+def test_player_load_guards_type():
+    """严重6: localStorage 读到 null/数组/损坏值不能直接当对象用, 否则
+    LIKE['id'] 抛 TypeError -> 黑屏。"""
+    body = _js_body()
+    assert "function obj(k)" in body, "要有 obj() 收口函数"
+    assert "!Array.isArray(v)" in body, "obj() 要排除数组"
+    for name in ("LIKE", "FAV", "FOLLOW", "CMT"):
+        assert re.search(rf"\b{name}\s*=\s*obj\(LS\.", body), f"{name} 要用 obj() 初始化"
+
+
+def test_player_pos_saves_id_not_index():
+    """严重7: 记录位置要存视频 id 而不是下标, 否则新增下载后排序变了,
+    恢复的位置会指向错视频。"""
+    body = _js_body()
+    assert "function savePos()" in body, "要有 savePos()"
+    m = re.search(r"function savePos\(\)\s*\{(.*?)\n\}", body, re.S)
+    assert "it.id" in m.group(1), "savePos 要存 it.id"
+    # 恢复时按 id 找回下标(兼容旧版数字)
+    assert "findIndex((it) => it.id === lastRaw)" in body, (
+        "恢复位置要按 id findIndex")
+
+
+def test_player_play_only_mutes_on_notallowed():
+    """中等8: play() 的 catch 只能对 NotAllowedError 降级静音, 不能因为
+    解码错误/AbortError 就永久静音并持久化。"""
+    body = _js_body()
+    m = re.search(r"function play\(i\)\s*\{(.*?)\n\}", body, re.S)
+    assert "err.name === 'NotAllowedError'" in m.group(1), (
+        "play() catch 只对 NotAllowedError 降级静音")
+
+
+def test_player_video_error_clears_src_for_retry():
+    """中等9: video 出错后要 delete v.dataset.src, 否则 lazyLoad 因
+    dataset.src 已存在而永不重试。"""
+    body = _js_body()
+    m = re.search(r"addEventListener\('error',\s*\(\)\s*=>\s*\{(.*?)\}\)", body, re.S)
+    assert m, "找不到 error 处理"
+    assert "delete v.dataset.src" in m.group(1), "error 后要清 src 标记"
+
+
+def test_player_grid_search_debounced():
+    """中等10: 搜索框每敲一个字全量重建网格很卡, 必须 120ms 防抖。"""
+    body = _js_body()
+    assert "gridSearchTimer" in body, "要有 gridSearchTimer"
+    assert "setTimeout(buildGrid, 120)" in body, "搜索要 120ms 防抖"
+
+
+def test_player_follow_key_normalized():
+    """中等11: 关注键要统一用 it.author||'' 而不是有的地方用裸 it.author,
+    否则空作者 key 不一致导致计数/筛选错位。"""
+    body = _js_body()
+    # buildStage 的 follow 按钮 class 与文案都该用 it.author || ''
+    m = re.search(r"function buildStage\(\)\s*\{(.*?)\n\}", body, re.S)
+    assert "FOLLOW[it.author || '']" in m.group(1), (
+        "buildStage 的关注态要用 it.author || ''")
+
+
+def test_player_save_reports_quota_failure():
+    """中等12: localStorage 写满被吞, 现在 save() 要返回布尔并 toast。"""
+    body = _js_body()
+    m = re.search(r"function save\(k, v\)\s*\{(.*?)\n\}", body, re.S)
+    assert "return false" in m.group(1), "save 失败要 return false"
+    assert "return true" in m.group(1), "save 成功要 return true"
+
+
+def test_player_drag_has_pointercancel():
+    """中等13: 进度条拖动要有 pointercancel 兜底, 且用对象记 drag 而非
+    全局布尔, 避免多根手指/取消时状态残留。"""
+    body = _js_body()
+    assert "let drag   = null" in body or "let drag = null" in body, "drag 改成对象/空"
+    assert "addEventListener('pointercancel'" in body, "要有 pointercancel 兜底"
 
 
 # ------------------------------- 4. 真浏览器端到端(缺 Chrome 则 skip)

@@ -377,10 +377,9 @@
 </div>
 
 <div id="keys">
-  <div><kbd>↑</kbd><kbd>↓</kbd> 切换视频</div>
-  <div><kbd>空格</kbd> 暂停 / 播放</div>
-  <div><kbd>M</kbd> 静音　<kbd>G</kbd> 网格</div>
-  <div><kbd>F</kbd> 全屏　<kbd>D</kbd> 点赞</div>
+  <div><kbd>↑</kbd><kbd>↓</kbd> 切换视频　<kbd>空格</kbd> 暂停/播放</div>
+  <div><kbd>M</kbd> 静音　<kbd>G</kbd> 网格　<kbd>F</kbd> 全屏</div>
+  <div><kbd>D</kbd> 点赞　<kbd>S</kbd> 收藏　<kbd>C</kbd> 评论</div>
 </div>
 
 <div id="grid">
@@ -420,7 +419,7 @@
   </div>
   <div class="cl" id="cList"></div>
   <div class="cf">
-    <textarea id="cInput" placeholder="说点什么…（只存在本机，不会联网）" rows="1"></textarea>
+    <textarea id="cInput" placeholder="说点什么…（只存在本机，不会联网）" rows="1" maxlength="200"></textarea>
     <button class="send" id="cSend" disabled>发送</button>
   </div>
 </div>
@@ -459,7 +458,15 @@ let VIEW   = [];       // 过滤后（网格用）
 let cur    = 0;        // 当前播放的 ITEMS 下标
 let cfg    = {grid:true, mute:true, auto:true, loop:false};
 let slides = [];       // 与 ITEMS 一一对应的 DOM
-let dragging = false;  // 进度条拖动中
+let drag   = null;     // 进度条拖动中：{el, wasPlaying}，用 null 表示没在拖
+let gridSearchTimer = 0;  // 网格搜索防抖
+
+/* 记录"上次看到哪个视频" —— 存视频 id 而不是下标, 这样新增下载后排序
+   变了也不会定位到错的那个视频 */
+function savePos() {
+  const it = ITEMS[cur];
+  if (it) save(LS.pos, it.id);
+}
 
 
 /* ---------------- 本地存储 ---------------- */
@@ -468,12 +475,18 @@ function load(k, dflt) {
   catch (e) { return dflt; }
 }
 function save(k, v) {
-  try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {}
+  try { localStorage.setItem(k, JSON.stringify(v)); return true; }
+  catch (e) { toast('本机存储已满，这条没保存下来（可以清一下浏览器缓存）'); return false; }
 }
-let LIKE   = load(LS.like, {});
-let FAV    = load(LS.fav, {});
-let FOLLOW = load(LS.follow, {});
-let CMT    = load(LS.cmt, {});
+/* load() 可能读到损坏/旧版本的数据（比如 null 或数组），统一收口成对象 */
+function obj(k) {
+  const v = load(k, null);
+  return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {};
+}
+let LIKE   = obj(LS.like);
+let FAV    = obj(LS.fav);
+let FOLLOW = obj(LS.follow);
+let CMT    = obj(LS.cmt);
 
 /* ---------------- 小工具 ---------------- */
 function esc(s) {
@@ -491,10 +504,13 @@ function fmtTime(sec) {
   const m = Math.floor(sec / 60);
   return m + ':' + String(Math.floor(sec % 60)).padStart(2, '0');
 }
-function fmtSize(b) {
-  if (b >= 1 << 30) return (b / (1 << 30)).toFixed(2) + ' GB';
-  if (b >= 1 << 20) return (b / (1 << 20)).toFixed(1) + ' MB';
-  return Math.round(b / 1024) + ' KB';
+/* 头像取一个字：优先取第一个完整字符（emoji 代理对 / 组合字），
+   不用 .slice(0,1) 那会切断代理对变成半个乱码 */
+function avatarChar(name) {
+  const s = String(name || '?').trim();
+  const cp = s.codePointAt(0);
+  if (cp == null) return '?';
+  return String.fromCodePoint(cp);
 }
 /* 平台判定：文件名/id 形状推断（下载时没有单独记平台字段） */
 function platOf(it) {
@@ -539,7 +555,7 @@ function buildStage() {
       <video playsinline preload="none" poster=""></video>
       <div class="glass">${ICON.play}</div>
       <div class="rail">
-        <div class="avatar">${esc((it.author || '?').slice(0, 1))}</div>
+        <div class="avatar">${esc(avatarChar(it.author))}</div>
         <button class="act like" data-act="like">
           ${ICON.heart}<span class="n">${LIKE[it.id] ? '已赞' : '赞'}</span>
         </button>
@@ -556,8 +572,8 @@ function buildStage() {
       <div class="meta">
         <div class="who">
           <b>@${esc(it.author || '未知作者')}</b>
-          <button class="follow${FOLLOW[it.author] ? ' on' : ''}" data-act="follow">
-            ${FOLLOW[it.author] ? '已关注' : '关注'}
+          <button class="follow${FOLLOW[it.author || ''] ? ' on' : ''}" data-act="follow">
+            ${FOLLOW[it.author || ''] ? '已关注' : '关注'}
           </button>
         </div>
         <div class="desc" data-act="desc">${linkify(it.title || '（无文案）')}</div>
@@ -574,10 +590,18 @@ function buildStage() {
   });
   stage.appendChild(frag);
   stage.querySelectorAll('.act').forEach((b) => {
-    b.addEventListener('click', (e) => { e.stopPropagation(); act(b.dataset.act); });
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const el = b.closest('.slide');
+      act(b.dataset.act, el ? Number(el.dataset.i) : null);
+    });
   });
   stage.querySelectorAll('.follow').forEach((b) => {
-    b.addEventListener('click', (e) => { e.stopPropagation(); act('follow'); });
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const el = b.closest('.slide');
+      act('follow', el ? Number(el.dataset.i) : null);
+    });
   });
   slides.forEach((el, i) => {
     const v = el.querySelector('video');
@@ -592,8 +616,7 @@ function buildStage() {
       if (now - lastTap < 300) {              // 双击
         clearTimeout(clickTimer);
         lastTap = 0;
-        popHeart(el, e.clientX, e.clientY);
-        if (!LIKE[ITEMS[i].id]) act('like');
+        if (!LIKE[ITEMS[i].id]) act('like', i);
         else popHeart(el, e.clientX, e.clientY);
       } else {
         lastTap = now;
@@ -611,24 +634,29 @@ function buildStage() {
         paintBar(i);
       }
     };
+    const endDrag = () => {
+      if (!drag || drag.el !== bar) return;
+      drag = null;
+      bar.classList.remove('drag');
+      if (wasPlaying) v.play().catch(() => {});
+    };
     bar.addEventListener('pointerdown', (e) => {
       if (e.button !== 0) return;
       e.stopPropagation();
-      dragging = true;
+      drag = {el: bar};
       bar.classList.add('drag');
       wasPlaying = !v.paused;
       v.pause();
       bar.setPointerCapture(e.pointerId);
       seekAt(e);
     });
-    bar.addEventListener('pointermove', (e) => { if (dragging) seekAt(e); });
+    bar.addEventListener('pointermove', (e) => { if (drag && drag.el === bar) seekAt(e); });
     bar.addEventListener('pointerup', (e) => {
-      if (!dragging) return;
-      dragging = false;
-      bar.classList.remove('drag');
+      if (!drag || drag.el !== bar) return;
       try { bar.releasePointerCapture(e.pointerId); } catch (err) {}
-      if (wasPlaying) v.play().catch(() => {});
+      endDrag();
     });
+    bar.addEventListener('pointercancel', endDrag);
 
     v.addEventListener('loadedmetadata', () => { paintBar(i); });
     v.addEventListener('timeupdate', () => { if (i === cur) paintBar(i); });
@@ -650,6 +678,8 @@ function buildStage() {
     });
     v.addEventListener('error', () => {
       if (i === cur) toast('这个视频播不了（文件可能损坏或格式不支持）');
+      // 出错后清掉 src 标记, 让下次 lazyLoad 能重新挂 src 再试一次
+      delete v.dataset.src;
     });
     el.querySelector('.desc').addEventListener('click', (e) => {
       e.stopPropagation();
@@ -658,9 +688,14 @@ function buildStage() {
   });
 }
 
-/* 文案里的 #话题 高亮 */
+/* 文案里的 #话题 高亮。必须先切话题段、再逐段转义 —— 若先 esc 再匹配，
+   撇号会被转成 &#39;，正则会从 # 与 39 之间把话题切错（"It's #vlog" -> "It&<span>#39;s</span>"） */
 function linkify(t) {
-  return esc(t).replace(/(#[^\s#]+)/g, '<span class="tag">$1</span>');
+  const s = String(t == null ? '' : t);
+  const parts = s.split(/(#[^\s#]+)/g);
+  return parts.map((seg) => seg.startsWith('#')
+    ? '<span class="tag">' + esc(seg) + '</span>'
+    : esc(seg)).join('');
 }
 
 function paintBar(i) {
@@ -709,9 +744,13 @@ function play(i) {
   const v = el.querySelector('video');
   v.muted = cfg.mute;
   const p = v.play();
-  if (p && p.catch) p.catch(() => {
-    // 浏览器自动播放策略：静音才能自动播。静音也失败就提示一下
-    if (!cfg.mute) { cfg.mute = true; syncMute(); v.muted = true; v.play().catch(() => {}); }
+  if (p && p.catch) p.catch((err) => {
+    // 只在"自动播放策略"拦截时降级成静音重试；解码错误/AbortError 不能静音。
+    // 否则视频文件一坏就永久静音，还把这个坏配置存进 localStorage。
+    if (err && err.name === 'NotAllowedError' && !cfg.mute) {
+      cfg.mute = true; syncMute(); v.muted = true;
+      v.play().catch(() => toast('浏览器禁止自动播放，点一下画面或按空格即可'));
+    }
   });
   el.classList.remove('paused');
 }
@@ -734,27 +773,30 @@ function go(delta, autoplay) {
   const n = cur + delta;
   if (n < 0) { toast('已经是第一个了'); return; }
   if (n >= ITEMS.length) { toast('已经到底了'); return; }
+  if ($('#cmt').classList.contains('open')) closeCmt();  // 换视频就关评论，防评论写错视频
   /* 先把上一个暂停掉。否则它会在后台继续播, 播完触发 ended 里的
      cfg.auto 逻辑再 go(1) 一次, 把刚切好的位置又拉走 —— 实测按 ↑ 回去后
      ~1s 又自己跳回原来那一格(日志: pause@2340ms, 5ms 后 scroll 回到 900)。 */
   pause(cur);
   cur = n;
   lazyLoad(cur);
+  unloadFar(cur);
   /* 程序化切换必须用瞬时跳转, 不能用 behavior:'smooth'。
      原因: #stage 上有 scroll-snap-type: y mandatory。平滑滚动滚到半路
      (实测 900 -> 869)就被 snap 强制吸回原位, onScrolled 于是把 cur 改回去
      —— 表现就是按 ↑/↓ 键"没反应"。瞬时跳转一步到位, snap 无从干扰;
      抖音自己切视频也是瞬切, 观感一致。用户手滑时仍是原生 snap 吸附。 */
   stage.scrollTop = cur * stage.clientHeight;
-  save(LS.pos, cur);
+  savePos();
   updateTop();
   highlight();
   if (autoplay !== false) setTimeout(() => play(cur), 120);
 }
 
 function updateTop() {
-  $('#posTxt').textContent = (cur + 1) + ' / ' + ITEMS.length;
-  $('#brandTxt').textContent = ITEMS.length ? '离线抖音' : '离线抖音';
+  const total = ITEMS.length;
+  $('#posTxt').textContent = total ? (cur + 1) + ' / ' + total : '0 / 0';
+  $('#brandTxt').textContent = '离线抖音';
 }
 
 /* 滚动驱动：scroll-snap 结束后判断当前是哪个 */
@@ -775,17 +817,21 @@ function onScrolled() {
   cur = i;
   lazyLoad(cur);
   unloadFar(cur);
-  save(LS.pos, cur);
+  savePos();
   updateTop();
   highlight();
   play(cur);
 }
 
 /* ---------------- 动作 ---------------- */
-function act(name) {
-  const it = ITEMS[cur];
+/* 动作必须落在"被点的那个格子"上, 而不是全局 cur —— 按钮绑在每张 slide 上,
+   快速切换瞬间点按钮时, 事件里的 this 才是用户真正想操作的那一个。 */
+function act(name, idx) {
+  const i = (idx == null ? cur : idx);
+  const it = ITEMS[i];
   if (!it) return;
-  const el = slides[cur];
+  const el = slides[i];
+  if (!el) return;
   if (name === 'like') {
     const on = !LIKE[it.id];
     if (on) LIKE[it.id] = 1; else delete LIKE[it.id];
@@ -793,7 +839,7 @@ function act(name) {
     const b = el.querySelector('.act.like');
     b.classList.toggle('on', on);
     b.querySelector('.n').textContent = on ? '已赞' : '赞';
-    popHeart(el, null, null);
+    if (i === cur) popHeart(el, null, null);
     // 网格角标刷新
     const c = gBody.querySelector(`.card[data-id="${CSS.escape(it.id)}"] .likedot`);
     if (c) c.style.display = on ? 'block' : 'none';
@@ -809,7 +855,7 @@ function act(name) {
     toast(on ? '已收藏到本地（只存本机）' : '取消收藏');
     if (flagActive()) buildGrid(); else refreshFlagCounts();
   } else if (name === 'cmt') {
-    openCmt();
+    openCmt(i);
   } else if (name === 'share') {
     // 全部本机操作：能开文件所在目录，或复制一个 file:// 路径
     const urls = location.origin + it.src;
@@ -850,15 +896,24 @@ function popHeart(el, x, y) {
 }
 
 /* ---------------- 评论（全本机） ---------------- */
-function openCmt() {
-  const it = ITEMS[cur];
+let cmtIdx = 0;         // 评论抽屉当前绑定的视频下标（切视频时抽屉会跟着关，防串写）
+let cmtFocusTimer = 0;  // openCmt 里延迟 focus 的定时器，closeCmt 要取消它
+
+function openCmt(i) {
+  const idx = (i == null ? cur : i);
+  const it = ITEMS[idx];
   if (!it) return;
+  cmtIdx = idx;
   renderCmt();
   $('#cmt').classList.add('open');
-  setTimeout(() => cInput.focus(), 260);
+  clearTimeout(cmtFocusTimer);
+  cmtFocusTimer = setTimeout(() => {
+    if ($('#cmt').classList.contains('open')) cInput.focus();
+  }, 260);
 }
 function closeCmt() {
   $('#cmt').classList.remove('open');
+  clearTimeout(cmtFocusTimer);
   cInput.value = '';
   cSend.disabled = true;
   // v2.5: 必须把焦点从输入框挪走。openCmt 里会自动 focus 输入框, 关抽屉时
@@ -869,7 +924,7 @@ function closeCmt() {
   }
 }
 function renderCmt() {
-  const it = ITEMS[cur];
+  const it = ITEMS[cmtIdx];
   if (!it) return;
   const list = CMT[it.id] || [];
   $('#cCount').textContent = list.length ? list.length + ' 条' : '';
@@ -882,7 +937,7 @@ function renderCmt() {
   cList.scrollTop = cList.scrollHeight;
 }
 function sendCmt() {
-  const it = ITEMS[cur];
+  const it = ITEMS[cmtIdx];
   const x = cInput.value.trim();
   if (!it || !x) return;
   (CMT[it.id] = CMT[it.id] || []).push({
@@ -892,7 +947,7 @@ function sendCmt() {
   cInput.value = '';
   cSend.disabled = true;
   renderCmt();
-  const b = slides[cur].querySelector('.act.cmt .n');
+  const b = slides[cmtIdx].querySelector('.act.cmt .n');
   b.textContent = (CMT[it.id] || []).length;
   toast('评论已保存（只在本机）');
 }
@@ -904,8 +959,6 @@ cSend.addEventListener('click', sendCmt);
 $('#cClose').addEventListener('click', closeCmt);
 
 /* ---------------- 网格 ---------------- */
-function platLabel(it) { return platOf(it); }
-
 function buildGrid() {
   const q = ($('#gSearch').value || '').trim().toLowerCase();
   const plat = ($('#gChips .chip.on') || {}).dataset ?
@@ -914,7 +967,7 @@ function buildGrid() {
     ($('#gFlags .chip.on').dataset.f || 'all') : 'all';
   VIEW = ITEMS.filter((it) => {
     // 两个维度是 AND: 平台 + 标记(赞/藏/关注) 可同时生效
-    if (plat !== 'all' && platLabel(it) !== plat) return false;
+    if (plat !== 'all' && platOf(it) !== plat) return false;
     if (flag === 'like'   && !LIKE[it.id]) return false;
     if (flag === 'fav'    && !FAV[it.id]) return false;
     if (flag === 'follow' && !FOLLOW[it.author || '']) return false;
@@ -985,13 +1038,14 @@ function refreshFlagCounts() {
 
 function jump(i) {
   if (i < 0 || i >= ITEMS.length) return;
+  if ($('#cmt').classList.contains('open')) closeCmt();  // 换视频就关评论
   pause(cur);
   cur = i;
   lazyLoad(cur);
   unloadFar(cur);
   /* 同样是瞬时跳转, 理由见 go() 里的注释 */
   stage.scrollTop = cur * stage.clientHeight;
-  save(LS.pos, cur);
+  savePos();
   updateTop();
   highlight();
   play(cur);
@@ -1012,7 +1066,11 @@ function highlight(which) {
   }
 }
 
-$('#gSearch').addEventListener('input', buildGrid);
+$('#gSearch').addEventListener('input', () => {
+  // 每敲一个字全量重建 175 张卡片很卡, 120ms 防抖
+  clearTimeout(gridSearchTimer);
+  gridSearchTimer = setTimeout(buildGrid, 120);
+});
 $('#gChips').addEventListener('click', (e) => {
   const b = e.target.closest('.chip');
   if (!b) return;
@@ -1086,6 +1144,8 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'm') { cfg.mute = !cfg.mute; syncMute(); toast(cfg.mute ? '已静音' : '已开声音'); }
   else if (k === 'g') { cfg.grid = !cfg.grid; syncGrid(); }
   else if (k === 'd') { act('like'); }
+  else if (k === 's') { act('fav'); }
+  else if (k === 'c') { openCmt(); }
   else if (k === 'f') {
     if (document.fullscreenElement) document.exitFullscreen();
     else document.documentElement.requestFullscreen().catch(() => {});
@@ -1117,8 +1177,16 @@ async function boot() {
   // 按下载时间倒序（新的在前），跟抖音的推荐感接近
   ITEMS.sort((a, b) => (b.time || 0) - (a.time || 0));
 
-  const last = Number(load(LS.pos, 0)) || 0;
-  cur = Math.max(0, Math.min(ITEMS.length - 1, last));
+  // 恢复位置：存的可能是旧版下标(数字)或新版视频 id(字符串)
+  const lastRaw = load(LS.pos, null);
+  let last = 0;
+  if (typeof lastRaw === 'number' && isFinite(lastRaw)) {
+    last = Math.max(0, Math.min(ITEMS.length - 1, Math.floor(lastRaw)));
+  } else if (typeof lastRaw === 'string' && lastRaw) {
+    const k = ITEMS.findIndex((it) => it.id === lastRaw);
+    last = k >= 0 ? k : 0;
+  }
+  cur = last;
 
   buildStage();
   syncGrid();
