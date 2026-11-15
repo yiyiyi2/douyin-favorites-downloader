@@ -358,19 +358,27 @@ class State:
         with self.lock:
             return aweme_id in self.done
 
+    def _flush(self):
+        """把 self.done 落盘。调用方必须已经持有 self.lock。
+
+        落盘失败一律忽略: 状态文件写不进去不该让下载流程崩掉,
+        下次 mark/remove 还会再试。
+        """
+        try:
+            self.path.write_text(
+                json.dumps(self.done, ensure_ascii=False, indent=1),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
     def remove(self, aweme_id: str) -> bool:
         """删一条记录并落盘。面板「删除」走这里, 和 mark() 共用一把锁, 不会互相覆盖。"""
         with self.lock:
             if str(aweme_id) not in self.done:
                 return False
             self.done.pop(str(aweme_id), None)
-            try:
-                self.path.write_text(
-                    json.dumps(self.done, ensure_ascii=False, indent=1),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
+            self._flush()
             return True
 
     def mark(self, aweme_id: str, path: Path, quality: str):
@@ -380,13 +388,7 @@ class State:
                 "quality": quality,
                 "time": int(time.time()),
             }
-            try:
-                self.path.write_text(
-                    json.dumps(self.done, ensure_ascii=False, indent=1),
-                    encoding="utf-8",
-                )
-            except Exception:
-                pass
+            self._flush()
 
 
 # ---------------------------------------------------------------------------

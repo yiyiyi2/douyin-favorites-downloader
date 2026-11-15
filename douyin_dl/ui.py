@@ -1518,6 +1518,23 @@ class _Handler(BaseHTTPRequestHandler):
             pass
         return True
 
+    def _recent_target(self, body: dict) -> Path | None:
+        """按 body 里的 id 在最近记录里找出真实存在的本地路径。
+
+        file/reveal 两个动作都要这一步(以前各写一遍), 抽出来统一做
+        id 白名单 + 相对路径还原 + 存在性校验。
+        """
+        aid = _safe_id(body.get("id"))
+        if not aid:
+            return None
+        for x in self.bus._recent():
+            if x["id"] != aid:
+                continue
+            target = _rel_path(self.bus.workspace, x.get("file"))
+            if target and target.exists():
+                return target
+        return None
+
     def _open(self, body: dict) -> bool:
         what = body.get("what")
         try:
@@ -1525,40 +1542,34 @@ class _Handler(BaseHTTPRequestHandler):
                 os.startfile(str(self.bus.out_dir))          # noqa: S606
                 return True
             if what == "file":
-                aid = _safe_id(body.get("id"))
-                for x in self.bus._recent():
-                    if x["id"] == aid:
-                        target = _rel_path(self.bus.workspace, x.get("file"))
-                        if not target or not target.exists():
-                            continue
-                        if target.is_dir():
-                            os.startfile(str(target))         # noqa: S606 图文作品是目录, 只能开目录
-                        else:
-                            before = {w["hwnd"] for w in _win_list()}
-                            os.startfile(str(target))         # noqa: S606 用系统默认播放器直接播放视频
-                            # 播放器起来后把它拉到前台, 免得窗口躲在后面还要用户自己点。
-                            # 放线程里做, 不拖慢面板这次的请求。
-                            threading.Thread(
-                                target=_activate_player,
-                                args=(before, target.stem),
-                                name="dy-player-front",
-                                daemon=True,
-                            ).start()
-                        return True
+                target = self._recent_target(body)
+                if not target:
+                    return False
+                if target.is_dir():
+                    os.startfile(str(target))         # noqa: S606 图文作品是目录, 只能开目录
+                else:
+                    before = {w["hwnd"] for w in _win_list()}
+                    os.startfile(str(target))         # noqa: S606 用系统默认播放器直接播放视频
+                    # 播放器起来后把它拉到前台, 免得窗口躲在后面还要用户自己点。
+                    # 放线程里做, 不拖慢面板这次的请求。
+                    threading.Thread(
+                        target=_activate_player,
+                        args=(before, target.stem),
+                        name="dy-player-front",
+                        daemon=True,
+                    ).start()
+                return True
             if what == "reveal":
-                aid = _safe_id(body.get("id"))
-                for x in self.bus._recent():
-                    if x["id"] == aid:
-                        target = _rel_path(self.bus.workspace, x.get("file"))
-                        if not target or not target.exists():
-                            continue
-                        if target.is_file():
-                            subprocess.Popen(
-                                ["explorer", "/select,", str(target)],
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                        else:
-                            os.startfile(str(target))         # noqa: S606
-                        return True
+                target = self._recent_target(body)
+                if not target:
+                    return False
+                if target.is_file():
+                    subprocess.Popen(
+                        ["explorer", "/select,", str(target)],
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                else:
+                    os.startfile(str(target))         # noqa: S606
+                return True
             if what == "log":
                 os.startfile(str(self.bus.log_file))          # noqa: S606
                 return True

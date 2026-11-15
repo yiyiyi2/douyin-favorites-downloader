@@ -68,6 +68,19 @@ def popen_hidden(cmd, **kw):
     return subprocess.Popen(cmd, **kw)
 
 
+def _drop_part(part: Path):
+    """删掉下载断点文件, 删不掉也不算错。
+
+    下载路径上有四个地方要清断点(416 空断点 / 内容不是视频 / 分段失败 /
+    分段大小对不上 / 分段异常), 以前每个地方都写一遍 try/unlink/except,
+    抽出来一处维护。真正的错误由调用方自己 log + return False。
+    """
+    try:
+        part.unlink()
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------
 # 类型归一化 —— 抖音接口字段的类型说变就变, 这里统一挡一层
 # --------------------------------------------------------------------------
@@ -583,10 +596,7 @@ def download(
                     # .part 是空的(或不存在)却还收到 416: 服务端/断点状态不对。
                     # 以前直接 break, 会留下一个空 .part, 下次重试还是 416,
                     # 这条视频就永远下不下来。现在删掉断点重新完整 GET。
-                    try:
-                        part.unlink()
-                    except OSError:
-                        pass
+                    _drop_part(part)
                     log("      ! 416 且断点为空, 删掉断点重新完整下载")
                     continue
                 r.raise_for_status()
@@ -636,10 +646,7 @@ def download(
                             last = time.time()
                 if bad_content:
                     log("      ! 内容看起来是网页而不是视频, 换候选")
-                    try:
-                        part.unlink()
-                    except OSError:
-                        pass
+                    _drop_part(part)
                     return False
             got = part.stat().st_size if part.exists() else 0
             if expect and got < expect:
@@ -839,18 +846,12 @@ def download_parallel(
                 if not fut.result():
                     ok_all = False
         if not ok_all:
-            try:
-                part.unlink()
-            except OSError:
-                pass
+            _drop_part(part)
             return False
         have = part.stat().st_size if part.exists() else 0
         if have != total:
             log(f"      ! 分段下载后大小不对: {have}/{total}")
-            try:
-                part.unlink()
-            except OSError:
-                pass
+            _drop_part(part)
             return False
         if on_progress:
             try:
@@ -861,10 +862,7 @@ def download_parallel(
         return True
     except Exception as e:  # noqa: BLE001
         log(f"      ! 分段下载异常: {str(e)[:80]}")
-        try:
-            part.unlink()
-        except OSError:
-            pass
+        _drop_part(part)
         return False
 
 

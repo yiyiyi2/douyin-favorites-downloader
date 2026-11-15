@@ -41,6 +41,11 @@ REFERER_BILI = "https://www.bilibili.com/"
 API_VIEW = "https://api.bilibili.com/x/web-interface/view"
 API_PLAYURL = "https://api.bilibili.com/x/player/playurl"
 
+# B站所有请求都必须带这一套头: API 侧不带 B站 Referer 会被挡成 403/非 JSON,
+# CDN 直链侧不带则一律 403 text/html(实测)。三处调用点共用这一个常量,
+# 免得以后改一处漏一处又变成"只有画面没声音"那种 bug。
+BILI_HEADERS = {"Referer": REFERER_BILI, "Origin": "https://www.bilibili.com"}
+
 # BV 号: BV + 10 位 base58-ish；av 号: av + 数字
 _BV_RE = re.compile(r"^BV[0-9A-Za-z]{10}$")
 _AV_RE = re.compile(r"^av(\d+)$", re.IGNORECASE)
@@ -258,8 +263,7 @@ def _api_get(session: requests.Session, url: str, params: dict,
     都能通。session 可能是全局共用的那个(Referer 是抖音), 所以这里逐请求覆盖。
     """
     r = session.get(url, params=params, timeout=timeout,
-                    headers={"Referer": REFERER_BILI,
-                             "Origin": "https://www.bilibili.com"})
+                    headers=dict(BILI_HEADERS))
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, dict):
@@ -379,16 +383,15 @@ def _download_raw(session: requests.Session, urls: list[str], dest: Path,
         # v2.2: 大文件(B站 4K 轨动辄几百 MB)走分段并发。
         # CDN 通常限的是单连接速率, 不是账号速率 —— 实测同一个 448MB 的
         # 4K 轨, 单连接 1.96 MB/s, 8 路并发 13.37 MB/s(6.83 倍)。
-        hdrs = {"Referer": REFERER_BILI, "Origin": "https://www.bilibili.com"}
         if core.download_parallel(session, url, dest, log=log,
-                                  on_progress=on_progress, headers=hdrs):
+                                  on_progress=on_progress,
+                                  headers=dict(BILI_HEADERS)):
             return True
         # 分段没成功(探不到总长 / 服务端不支持 Range)就走原来的单连接
         for attempt in range(1, retries + 1):
             try:
                 with session.get(url, stream=True, timeout=60,
-                                 headers={"Referer": REFERER_BILI,
-                                          "Origin": "https://www.bilibili.com"}) as r:
+                                 headers=dict(BILI_HEADERS)) as r:
                     if r.status_code >= 400:
                         log(f"      ! HTTP {r.status_code}, 换地址")
                         break

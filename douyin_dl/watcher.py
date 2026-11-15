@@ -105,6 +105,51 @@ def _cap_set(s: set, limit: int) -> int:
     return over
 
 
+def _as_mapping(src: Any) -> dict | None:
+    """把 body/req 归一化成 dict。
+
+    钩子回传的 body/req 可能是三种形态: 已经是 dict、JSON 字符串(`{...}`)、
+    或者 form 字符串(`a=1&b=2`)。三个平台各自的 action 解析都要做这件事,
+    以前是每个函数里复制一遍一模一样的 20 行, 抽在这里统一。
+    解析不出来统一返回 None, 调用方按"没这份数据"处理。
+    """
+    if isinstance(src, dict):
+        return src
+    if not isinstance(src, str):
+        return None
+    t = src.strip()
+    if not t:
+        return None
+    if t[0] in "{[":
+        try:
+            obj = json.loads(t)
+        except Exception:
+            return None
+        return obj if isinstance(obj, dict) else None
+    if "=" in t:
+        try:
+            return dict(parse_qsl(t, keep_blank_values=True))
+        except Exception:
+            return None
+    return None
+
+
+def _pick_action(req: Any, body: Any, decide) -> str:
+    """先看 req 再看 body, 用 decide(mapping) 判出 "1"/"0"/""。
+
+    抖音/快手/B站的收藏动作语义各不相同(抖音 1 收藏 0 取消、快手 1 收藏 2 取消、
+    B站靠 add_media_ids/del_media_ids), 但"两份来源里优先用请求体"这条规矩一样。
+    """
+    for src in (req, body):
+        m = _as_mapping(src)
+        if m is None:
+            continue
+        got = decide(m)
+        if got:
+            return got
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # 注入脚本
 #
@@ -757,14 +802,7 @@ def ks_action_value(url: str, body: Any = None, req: Any = None) -> str:
       `collect: photo.collected ? 2 : 1`  →  collect=1 收藏, collect=2 取消收藏
     注意这和抖音的 1/0 语义不同, 千万别照抄 _action_norm。
     """
-    def pick(src) -> str:
-        if isinstance(src, str) and src.strip().startswith("{"):
-            try:
-                src = json.loads(src)
-            except Exception:
-                return ""
-        if not isinstance(src, dict):
-            return ""
+    def decide(src: dict) -> str:
         for k in ("collect", "collectAction"):
             if k in src:
                 try:
@@ -777,10 +815,9 @@ def ks_action_value(url: str, body: Any = None, req: Any = None) -> str:
                     return "0"
         return ""
 
-    for src in (req, body):
-        a = pick(src)
-        if a:
-            return a
+    a = _pick_action(req, body, decide)
+    if a:
+        return a
     # 兜底: 有些调用把 collect 放 query 里
     try:
         qs = (url or "").split("?", 1)[1] if "?" in (url or "") else ""
@@ -959,25 +996,7 @@ def bili_action_value(url: str, body: Any = None, req: Any = None) -> str:
     收藏 = add_media_ids 非空; 取消收藏 = del_media_ids 非空。
     注意 rid 是 **aid(纯数字)**, 不是 BV 号 —— 调用方要用 av 形式。
     """
-    def pick(src) -> str:
-        if isinstance(src, str):
-            t = src.strip()
-            if not t:
-                return ""
-            if t.startswith("{"):
-                try:
-                    src = json.loads(t)
-                except Exception:
-                    return ""
-            elif "=" in t:
-                try:
-                    src = dict(parse_qsl(t, keep_blank_values=True))
-                except Exception:
-                    return ""
-            else:
-                return ""
-        if not isinstance(src, dict):
-            return ""
+    def decide(src: dict) -> str:
         adds = _bili_str(src.get("add_media_ids") or src.get("addMediaIds")).strip()
         dels = _bili_str(src.get("del_media_ids") or src.get("delMediaIds")).strip()
         if adds:
@@ -994,34 +1013,12 @@ def bili_action_value(url: str, body: Any = None, req: Any = None) -> str:
                     return "0"
         return ""
 
-    for src in (req, body):
-        a = pick(src)
-        if a:
-            return a
-    return ""
+    return _pick_action(req, body, decide)
 
 
 def bili_action_rid(url: str, body: Any = None, req: Any = None) -> str:
     """取 B站收藏动作里的 rid（= aid），转成 av 号。"""
-    def pick(src) -> str:
-        if isinstance(src, str):
-            t = src.strip()
-            if not t:
-                return ""
-            if t.startswith("{"):
-                try:
-                    src = json.loads(t)
-                except Exception:
-                    return ""
-            elif "=" in t:
-                try:
-                    src = dict(parse_qsl(t, keep_blank_values=True))
-                except Exception:
-                    return ""
-            else:
-                return ""
-        if not isinstance(src, dict):
-            return ""
+    def decide(src: dict) -> str:
         rid = _bili_str(src.get("rid") or src.get("aid") or src.get("avid")).strip()
         if rid.isdigit():
             return f"av{rid}"
@@ -1029,11 +1026,7 @@ def bili_action_rid(url: str, body: Any = None, req: Any = None) -> str:
             return rid
         return ""
 
-    for src in (req, body):
-        got = pick(src)
-        if got:
-            return got
-    return ""
+    return _pick_action(req, body, decide)
 
 
 # ---------------------------------------------------------------------------
@@ -1212,6 +1205,27 @@ class BrowserWatcher:
     def _get_cached(self, aid: str) -> dict | None:
         with self._lock:
             return self.cache.get(aid)
+
+    def _notify_pending(self, aid: str):
+        """让面板立刻出现"解析中"占位, 不等详情抓回来。
+
+        三个站点(抖音/快手/B站)的收藏分支都要做同一件事, 抽出来避免
+        三份一模一样的 try/except 各改各的。面板回调失败绝不能影响主流程。
+        """
+        try:
+            self.on_pending(aid)
+        except Exception:
+            pass
+
+    def _submit_cached(self, cached: dict, aid: str, source: str, tag: str):
+        """把缓存里已有的数据直接交给下载器。
+
+        source 是面板上显示的来源名, tag 用于失败日志(如 "B站收藏")。
+        """
+        try:
+            self.on_aweme(cached, source)
+        except Exception as e:
+            self.log(f"  ! {tag}提交失败 {aid}: {e}")
 
     # -- 回调 --------------------------------------------------------------
     def _on_binding(self, source, payload):
@@ -1418,19 +1432,13 @@ class BrowserWatcher:
                     # 缓存里通常只有列表接口给的那点信息(没 DASH),
                     # 但 Downloader 会自己补 view+playurl, 所以能直接提交。
                     self.log(f"  · 新收藏 {aid} (B站), 直接下载")
-                    try:
-                        self.on_aweme(cached, "B站收藏")
-                    except Exception as e:
-                        self.log(f"  ! B站收藏提交失败 {aid}: {e}")
+                    self._submit_cached(cached, aid, "B站收藏", "B站收藏")
                     continue
                 with self._lock:
                     if aid in self._pending_actions:
                         continue
                     self._pending_actions.append(aid)
-                try:
-                    self.on_pending(aid)
-                except Exception:
-                    pass
+                self._notify_pending(aid)
                 self.log(f"  · 新收藏 {aid} (B站), 正在抓取视频信息…")
             return
 
@@ -1541,10 +1549,7 @@ class BrowserWatcher:
                 if cached:
                     # 命中 feed 缓存 → 立刻提交, 面板几乎零延迟
                     self.log(f"  · 新收藏 {aid} (快手), 已拿到视频信息, 直接下载")
-                    try:
-                        self.on_aweme(cached, "快手收藏")
-                    except Exception as e:
-                        self.log(f"  ! 快手收藏提交失败 {aid}: {e}")
+                    self._submit_cached(cached, aid, "快手收藏", "快手收藏")
                     continue
                 # 冷启动或从分享链接直接进详情页时可能没缓存,
                 # 才走无头详情页兜底(可能被风控挡, 失败会明确报给面板)
@@ -1552,10 +1557,7 @@ class BrowserWatcher:
                     if aid in self._pending_actions:
                         continue
                     self._pending_actions.append(aid)
-                try:
-                    self.on_pending(aid)
-                except Exception:
-                    pass
+                self._notify_pending(aid)
                 self.log(f"  · 新收藏 {aid} (快手), 正在抓取最新视频信息…")
             return
 
@@ -1568,11 +1570,6 @@ class BrowserWatcher:
         # (快手 /rest/v/..., 抖音 /aweme/v1/...), 硬塞进同一个分支只会互相干扰。
         if self._is_ks_url(url):
             self._on_ks_payload(kind, url, body, req, body_text, req_text)
-            return
-
-        # v2.1: B站也是独立一套(/x/... 风格, 且画质要另外请求 playurl)
-        if self._is_bili_url(url):
-            self._on_bili_payload(kind, url, body, req, body_text, req_text)
             return
 
         # v2.1: B站也是独立一套(/x/... 风格, 且画质要另外请求 playurl)
@@ -1712,10 +1709,7 @@ class BrowserWatcher:
                     else:
                         continue          # 已经在补全队列里, 别重复告知面板
                 # 先让面板上出现"解析中", 不用等详情抓回来
-                try:
-                    self.on_pending(aid)
-                except Exception:
-                    pass
+                self._notify_pending(aid)
                 self.log(f"  · 新收藏 {aid}, 正在抓取最新视频信息…")
 
     # -- 补全: 用无头浏览器取详情 -------------------------------------------
